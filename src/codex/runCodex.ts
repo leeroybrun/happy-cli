@@ -433,7 +433,8 @@ export async function runCodex(opts: {
                 thinking = false;
                 session.keepAlive(thinking, 'remote');
             }
-            // Reset diff processor on task end or abort
+            // Emit final diff for the turn (once), then reset
+            diffProcessor.flush();
             diffProcessor.reset();
         }
         if (msg.type === 'agent_reasoning_section_break') {
@@ -507,6 +508,7 @@ export async function runCodex(opts: {
 
             // Add UI feedback for completion
             if (success) {
+                diffProcessor.markPatchApplied();
                 const message = stdout || 'Files modified successfully';
                 messageBuffer.addMessage(message.substring(0, 200), 'result');
             } else {
@@ -709,6 +711,7 @@ export async function runCodex(opts: {
                 // Reset permission handler, reasoning processor, and diff processor
                 permissionHandler.reset();
                 reasoningProcessor.abort();  // Use abort to properly finish any in-progress tool calls
+                diffProcessor.flush();
                 diffProcessor.reset();
                 thinking = false;
                 session.keepAlive(thinking, 'remote');

@@ -26,6 +26,7 @@ class Configuration {
 
   public readonly isExperimentalEnabled: boolean
   public readonly disableCaffeinate: boolean
+  public readonly disableCodexDiffs: boolean
 
   constructor() {
     // Server configuration - priority: parameter > environment > default
@@ -53,6 +54,9 @@ class Configuration {
 
     this.isExperimentalEnabled = ['true', '1', 'yes'].includes(process.env.HAPPY_EXPERIMENTAL?.toLowerCase() || '');
     this.disableCaffeinate = ['true', '1', 'yes'].includes(process.env.HAPPY_DISABLE_CAFFEINATE?.toLowerCase() || '');
+    this.disableCodexDiffs =
+      ['true', '1', 'yes'].includes(process.env.HAPPY_DISABLE_CODEX_DIFFS?.toLowerCase() || '') ||
+      ['true', '1', 'yes'].includes(process.env.HAPPY_DISABLE_DIFFS?.toLowerCase() || '');
 
     this.currentCliVersion = packageJson.version
 
