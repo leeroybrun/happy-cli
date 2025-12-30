@@ -16,7 +16,7 @@ import os from 'node:os';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
 import { projectPath } from '@/projectPath';
-import { resolve, join } from 'node:path';
+import { resolve, join, basename } from 'node:path';
 import fs from 'node:fs';
 import { startHappyServer } from '@/claude/utils/startHappyServer';
 import { MessageBuffer } from "@/ui/ink/messageBuffer";
@@ -28,6 +28,7 @@ import { notifyDaemonSessionStarted } from "@/daemon/controlClient";
 import { registerKillSessionHandler } from "@/claude/registerKillSessionHandler";
 import { delay } from "@/utils/time";
 import { stopCaffeinate } from "@/utils/caffeinate";
+import { resumeCodex } from './resumeCodex';
 
 type ReadyEventOptions = {
     pending: unknown;
@@ -63,6 +64,7 @@ export function emitReadyIfIdle({ pending, queueSize, shouldExit, sendReady, not
 export async function runCodex(opts: {
     credentials: Credentials;
     startedBy?: 'daemon' | 'terminal';
+    resume?: true | string;
 }): Promise<void> {
     type PermissionMode = 'default' | 'read-only' | 'safe-yolo' | 'yolo';
     interface EnhancedMode {
@@ -226,6 +228,21 @@ export async function runCodex(opts: {
     let abortController = new AbortController();
     let shouldExit = false;
     let storedSessionIdForResume: string | null = null;
+    let resumeTranscriptFile: string | null = null;
+    let resumeContext: string | null = null;
+    let resumeContextForUi: string | null = null;
+    let resumeExecSummary: string | null = null;
+    let nextExplicitExperimentalResume: string | null = null;
+
+    //
+    // Resume support (CLI flag)
+    //
+    const resumeState = await resumeCodex(opts.resume);
+    resumeTranscriptFile = resumeState.resumeTranscriptFile;
+    resumeContext = resumeState.resumeContext;
+    resumeContextForUi = resumeState.resumeContextForUi;
+    resumeExecSummary = resumeState.resumeExecSummary;
+    nextExplicitExperimentalResume = resumeState.resumeTranscriptFile;
 
     /**
      * Handles aborting the current task/inference without exiting the process.
@@ -332,6 +349,24 @@ export async function runCodex(opts: {
             process.stdin.setRawMode(true);
         }
         process.stdin.setEncoding("utf8");
+    }
+
+    if (resumeTranscriptFile) {
+        const label = basename(resumeTranscriptFile);
+        messageBuffer.addMessage(`Resume loaded: ${label}`, 'status');
+        messageBuffer.addMessage('Context will be applied when you send your first message.', 'status');
+        if (resumeExecSummary) {
+            messageBuffer.addMessage('Resume summary (from codex exec resume):', 'status');
+            messageBuffer.addMessage(resumeExecSummary, 'system');
+        }
+    }
+
+    if (resumeContextForUi) {
+        const MAX_UI_RESUME_CHARS = 20000;
+        const clipped = resumeContextForUi.length > MAX_UI_RESUME_CHARS
+            ? `${resumeContextForUi.slice(0, MAX_UI_RESUME_CHARS)}\n\n…[truncated]\n`
+            : resumeContextForUi;
+        messageBuffer.addMessage(clipped, 'system');
     }
 
     //
@@ -638,8 +673,33 @@ export async function runCodex(opts: {
                 })();
 
                 if (!wasCreated) {
+                    const basePrompt = first ? message.message + '\n\n' + CHANGE_TITLE_INSTRUCTION : message.message;
+                    let initialPrompt = basePrompt;
+
+                    if (resumeContext) {
+                        messageBuffer.addMessage('Resuming previous context…', 'status');
+                        initialPrompt = trimIdent(`
+                        You are resuming work from a previous Codex session.
+
+                        Below is (1) a resume summary and (2) a recent-message excerpt from the previous session.
+                        Treat it as conversation history and continue from it.
+                        Do not claim you cannot access previous context; it is provided below.
+
+                        Full transcript file (JSONL), if you need deeper context: ${resumeTranscriptFile ?? 'unknown'}
+                        Only read it if necessary.
+
+                        <previous_session_transcript>
+                        ${resumeContext}
+                        </previous_session_transcript>
+
+                        Now respond to the user's new message below.
+                        `).trim() + '\n\n' + basePrompt;
+
+                        resumeContext = null;
+                        resumeTranscriptFile = null;
+                    }
                     const startConfig: CodexSessionConfig = {
-                        prompt: first ? message.message + '\n\n' + CHANGE_TITLE_INSTRUCTION : message.message,
+                        prompt: initialPrompt,
                         sandbox,
                         'approval-policy': approvalPolicy,
                         config: { mcp_servers: mcpServers }
@@ -666,6 +726,12 @@ export async function runCodex(opts: {
                             messageBuffer.addMessage('Resuming from aborted session...', 'status');
                         }
                         storedSessionIdForResume = null; // consume once
+                    }
+                    // Priority 3: Explicit CLI `--resume` transcript file (native Codex resume)
+                    else if (nextExplicitExperimentalResume) {
+                        resumeFile = nextExplicitExperimentalResume;
+                        nextExplicitExperimentalResume = null; // consume once
+                        logger.debug('[Codex] Using resume file from CLI --resume:', resumeFile);
                     }
                     
                     // Apply resume file if found

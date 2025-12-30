@@ -88,16 +88,47 @@ import { execFileSync } from 'node:child_process'
       
       // Parse startedBy argument
       let startedBy: 'daemon' | 'terminal' | undefined = undefined;
+      let resume: true | string | undefined = undefined;
+      let showCodexHelp = false;
       for (let i = 1; i < args.length; i++) {
-        if (args[i] === '--started-by') {
+        if (args[i] === '-h' || args[i] === '--help') {
+          showCodexHelp = true;
+        } else if (args[i] === '--started-by') {
           startedBy = args[++i] as 'daemon' | 'terminal';
+        } else if (args[i] === '--resume') {
+          const nextArg = args[i + 1];
+          if (typeof nextArg === 'string' && nextArg.length > 0 && !nextArg.startsWith('-')) {
+            resume = nextArg;
+            i++;
+          } else {
+            resume = true;
+          }
         }
+      }
+
+      if (showCodexHelp) {
+        console.log(`
+${chalk.bold('happy codex')} - Codex mode
+
+${chalk.bold('Usage:')}
+  happy codex [options]
+
+${chalk.bold('Options:')}
+  --resume [sessionId|file]   Resume from a previous Codex session (interactive if omitted)
+  --started-by <daemon|terminal>
+
+${chalk.bold('Examples:')}
+  happy codex
+  happy codex --resume
+  happy codex --resume sess_abc123
+`)
+        process.exit(0)
       }
       
       const {
         credentials
       } = await authAndSetupMachineIfNeeded();
-      await runCodex({credentials, startedBy});
+      await runCodex({credentials, startedBy, resume});
       // Do not force exit here; allow instrumentation to show lingering handles
     } catch (error) {
       console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
