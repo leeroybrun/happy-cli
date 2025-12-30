@@ -351,6 +351,61 @@ export async function runCodex(opts: {
     //
 
     const client = new CodexMcpClient();
+    /**
+     * Some Codex MCP deployments stream `task_complete` / `turn_aborted` events but
+     * do not reliably resolve the underlying MCP tool call (`codex` / `codex-reply`).
+     *
+     * If we await the tool call forever, the main loop never returns to
+     * `MessageQueue2.waitForMessages...` and new user messages get queued but never
+     * processed.
+     *
+     * To keep the session responsive, we abort the in-flight MCP tool call when we
+     * observe a terminal event for the turn.
+     */
+    let inFlightToolAbortController: AbortController | null = null;
+    let inFlightToolAbortTimer: NodeJS.Timeout | null = null;
+    let lastTurnTerminalEvent: 'task_complete' | 'turn_aborted' | null = null;
+
+    function isAbortError(error: unknown): boolean {
+        return error instanceof Error && error.name === 'AbortError';
+    }
+
+    function scheduleAbortInFlightToolCall(reason: string): void {
+        if (inFlightToolAbortTimer) {
+            clearTimeout(inFlightToolAbortTimer);
+            inFlightToolAbortTimer = null;
+        }
+        // Give Codex MCP a short chance to resolve the tool call naturally after emitting a terminal event.
+        // Some deployments never resolve, which deadlocks the main loop unless we abort.
+        inFlightToolAbortTimer = setTimeout(() => {
+            if (inFlightToolAbortController && !inFlightToolAbortController.signal.aborted) {
+                logger.debug(`[Codex] Aborting in-flight tool call (${reason}) after terminal event grace period`);
+                inFlightToolAbortController.abort();
+            }
+        }, 1000);
+    }
+
+    function anyAbortSignal(signals: AbortSignal[]): AbortSignal {
+        const anyFn = (AbortSignal as any)?.any;
+        if (typeof anyFn === 'function') {
+            return anyFn(signals);
+        }
+        // Fallback for older runtimes: best-effort "any" signal (listener cleanup omitted).
+        const controller = new AbortController();
+        const onAbort = () => controller.abort();
+        for (const s of signals) {
+            if (s.aborted) {
+                controller.abort();
+                break;
+            }
+            try {
+                s.addEventListener('abort', onAbort, { once: true });
+            } catch {
+                // ignore
+            }
+        }
+        return controller.signal;
+    }
 
     // Helper: find Codex session transcript for a given sessionId
     function findCodexResumeFile(sessionId: string | null): string | null {
@@ -459,9 +514,13 @@ export async function runCodex(opts: {
         } else if (msg.type === 'task_started') {
             messageBuffer.addMessage('Starting task...', 'status');
         } else if (msg.type === 'task_complete') {
+            lastTurnTerminalEvent = 'task_complete';
+            scheduleAbortInFlightToolCall('task_complete');
             messageBuffer.addMessage('Task completed', 'status');
             sendReady();
         } else if (msg.type === 'turn_aborted') {
+            lastTurnTerminalEvent = 'turn_aborted';
+            scheduleAbortInFlightToolCall('turn_aborted');
             messageBuffer.addMessage('Turn aborted', 'status');
             sendReady();
         }
@@ -707,6 +766,13 @@ export async function runCodex(opts: {
                     }
                 })();
 
+                // Per-turn terminal state + per-tool-call abort controller. We may abort the MCP tool call
+                // after terminal events to avoid getting stuck if Codex does not resolve the tool response.
+                lastTurnTerminalEvent = null;
+                const toolAbortController = new AbortController();
+                inFlightToolAbortController = toolAbortController;
+                const toolSignal = anyAbortSignal([abortController.signal, toolAbortController.signal]);
+
                 if (!wasCreated) {
                     const startConfig: CodexSessionConfig = {
                         prompt: first ? message.message + '\n\n' + CHANGE_TITLE_INSTRUCTION : message.message,
@@ -744,7 +810,7 @@ export async function runCodex(opts: {
                     }
                     const startResponse = await client.startSession(
                         startConfig,
-                        { signal: abortController.signal }
+                        { signal: toolSignal }
                     );
                     const startError = extractCodexToolErrorText(startResponse);
                     if (startError) {
@@ -759,7 +825,7 @@ export async function runCodex(opts: {
                 } else {
                     const response = await client.continueSession(
                         message.message,
-                        { signal: abortController.signal }
+                        { signal: toolSignal }
                     );
                     logger.debug('[Codex] continueSession response:', response);
                     const continueError = extractCodexToolErrorText(response);
@@ -773,9 +839,15 @@ export async function runCodex(opts: {
                 }
             } catch (error) {
                 logger.warn('Error in codex session:', error);
-                const isAbortError = error instanceof Error && error.name === 'AbortError';
+                const isAbort = isAbortError(error);
 
-                if (isAbortError) {
+                // If we aborted the MCP tool call after Codex already finished the turn, don't
+                // surface it as a user abort. This keeps the queue consumer alive.
+                if (isAbort && lastTurnTerminalEvent === 'task_complete') {
+                    logger.debug('[Codex] Ignoring AbortError triggered by task_complete');
+                } else if (isAbort && lastTurnTerminalEvent === 'turn_aborted') {
+                    logger.debug('[Codex] Ignoring AbortError triggered by turn_aborted');
+                } else if (isAbort) {
                     messageBuffer.addMessage('Aborted by user', 'status');
                     session.sendSessionEvent({ type: 'message', message: 'Aborted by user' });
                     // Abort cancels the current task/inference but keeps the Codex session alive.
@@ -793,6 +865,12 @@ export async function runCodex(opts: {
                     }
                 }
             } finally {
+                inFlightToolAbortController = null;
+                lastTurnTerminalEvent = null;
+                if (inFlightToolAbortTimer) {
+                    clearTimeout(inFlightToolAbortTimer);
+                    inFlightToolAbortTimer = null;
+                }
                 // Reset permission handler, reasoning processor, and diff processor
                 permissionHandler.reset();
                 reasoningProcessor.abort();  // Use abort to properly finish any in-progress tool calls
