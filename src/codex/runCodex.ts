@@ -370,7 +370,7 @@ export async function runCodex(opts: {
         return error instanceof Error && error.name === 'AbortError';
     }
 
-    function scheduleAbortInFlightToolCall(reason: string): void {
+    function scheduleAbortInFlightToolCall(reason: string, controller: AbortController): void {
         if (inFlightToolAbortTimer) {
             clearTimeout(inFlightToolAbortTimer);
             inFlightToolAbortTimer = null;
@@ -378,9 +378,12 @@ export async function runCodex(opts: {
         // Give Codex MCP a short chance to resolve the tool call naturally after emitting a terminal event.
         // Some deployments never resolve, which deadlocks the main loop unless we abort.
         inFlightToolAbortTimer = setTimeout(() => {
-            if (inFlightToolAbortController && !inFlightToolAbortController.signal.aborted) {
+            // Only abort the exact in-flight controller that was active when we scheduled this timer.
+            // Codex may deliver terminal events late (after the tool call finished); in that case we
+            // must not abort a subsequent turn's tool call.
+            if (inFlightToolAbortController === controller && !controller.signal.aborted) {
                 logger.debug(`[Codex] Aborting in-flight tool call (${reason}) after terminal event grace period`);
-                inFlightToolAbortController.abort();
+                controller.abort();
             }
         }, 1000);
     }
@@ -514,13 +517,19 @@ export async function runCodex(opts: {
         } else if (msg.type === 'task_started') {
             messageBuffer.addMessage('Starting task...', 'status');
         } else if (msg.type === 'task_complete') {
-            lastTurnTerminalEvent = 'task_complete';
-            scheduleAbortInFlightToolCall('task_complete');
+            // Only schedule aborts when a tool call is actually in-flight.
+            // Codex can deliver terminal events late (after we already returned to idle).
+            if (inFlightToolAbortController) {
+                lastTurnTerminalEvent = 'task_complete';
+                scheduleAbortInFlightToolCall('task_complete', inFlightToolAbortController);
+            }
             messageBuffer.addMessage('Task completed', 'status');
             sendReady();
         } else if (msg.type === 'turn_aborted') {
-            lastTurnTerminalEvent = 'turn_aborted';
-            scheduleAbortInFlightToolCall('turn_aborted');
+            if (inFlightToolAbortController) {
+                lastTurnTerminalEvent = 'turn_aborted';
+                scheduleAbortInFlightToolCall('turn_aborted', inFlightToolAbortController);
+            }
             messageBuffer.addMessage('Turn aborted', 'status');
             sendReady();
         }
