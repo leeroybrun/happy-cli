@@ -298,6 +298,7 @@ export type Metadata = {
   },
   machineId?: string,
   claudeSessionId?: string, // Claude Code session ID
+  codexSessionId?: string, // Codex session/conversation ID (uuid)
   tools?: string[],
   slashCommands?: string[],
   homeDir: string,
