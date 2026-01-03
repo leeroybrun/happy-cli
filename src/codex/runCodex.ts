@@ -65,6 +65,7 @@ export function emitReadyIfIdle({ pending, queueSize, shouldExit, sendReady, not
 export async function runCodex(opts: {
     credentials: Credentials;
     startedBy?: 'daemon' | 'terminal';
+    resume?: string;
 }): Promise<void> {
     type PermissionMode = 'default' | 'read-only' | 'safe-yolo' | 'yolo';
     interface EnhancedMode {
@@ -486,6 +487,25 @@ export async function runCodex(opts: {
     client.setHandler((msg) => {
         logger.debug(`[Codex] MCP message: ${JSON.stringify(msg)}`);
 
+        if (msg?.type === 'session_configured') {
+            const nextId =
+                (msg as any)?.session_id
+                ?? (msg as any)?.sessionId
+                ?? (msg as any)?.session_id
+                ?? (msg as any)?.sessionId;
+            if (typeof nextId === 'string' && nextId) {
+                session.updateMetadata((currentMetadata) => {
+                    if (currentMetadata.codexSessionId) {
+                        return currentMetadata;
+                    }
+                    return {
+                        ...currentMetadata,
+                        codexSessionId: nextId,
+                    };
+                });
+            }
+        }
+
         // Add messages to the ink UI buffer based on message type
         if (msg.type === 'agent_message') {
             messageBuffer.addMessage(msg.message, 'assistant');
@@ -689,7 +709,13 @@ export async function runCodex(opts: {
         await client.connect();
         logger.debug('[codex]: client.connect done');
         let wasCreated = false;
-
+        if (opts.resume && opts.resume.trim()) {
+            const resumeId = opts.resume.trim();
+            client.setResumedConversationId(resumeId);
+            wasCreated = true;
+            first = false;
+            messageBuffer.addMessage(`Resuming Codex session ${resumeId.substring(0, 8)}…`, 'status');
+        }
         let currentModeHash: string | null = null;
         let pending: { message: string; mode: EnhancedMode; isolate: boolean; hash: string } | null = null;
         // If we restart (e.g., mode change), use this to carry a resume file
