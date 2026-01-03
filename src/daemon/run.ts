@@ -1,6 +1,5 @@
 import fs from 'fs/promises';
 import os from 'os';
-import * as tmp from 'tmp';
 
 import { ApiClient } from '@/api/api';
 import { TrackedSession } from './types';
@@ -14,6 +13,7 @@ import packageJson from '../../package.json';
 import { getEnvironmentInfo } from '@/ui/doctor';
 import { spawnHappyCLI } from '@/utils/spawnHappyCLI';
 import { writeDaemonState, DaemonLocallyPersistedState, readDaemonState, acquireDaemonLock, releaseDaemonLock } from '@/persistence';
+import { supportsVendorResume } from '@/utils/agentCapabilities';
 
 import { cleanupDaemonState, isDaemonRunningCurrentlyInstalledHappyVersion, stopDaemon } from './controlClient';
 import { startDaemonControlServer } from './controlServer';
@@ -238,16 +238,12 @@ export async function startDaemon(): Promise<void> {
         let extraEnv: Record<string, string> = {};
         if (options.token) {
           if (options.agent === 'codex') {
-
-            // Create a temporary directory for Codex
-            const codexHomeDir = tmp.dirSync();
-
-            // Write the token to the temporary directory
-            fs.writeFile(join(codexHomeDir.name, 'auth.json'), options.token);
-
-            // Set the environment variable for Codex
+            // Ensure Codex uses the standard home so rollouts can be found for resume.
+            const codexHomeDir = join(os.homedir(), '.codex');
+            await fs.mkdir(codexHomeDir, { recursive: true });
+            await fs.writeFile(join(codexHomeDir, 'auth.json'), options.token);
             extraEnv = {
-              CODEX_HOME: codexHomeDir.name
+              CODEX_HOME: codexHomeDir
             };
           } else { // Assuming claude
             extraEnv = {
@@ -281,8 +277,18 @@ export async function startDaemon(): Promise<void> {
           '--started-by', 'daemon'
         ];
 
-        // TODO: In future, sessionId could be used with --resume to continue existing sessions
-        // For now, we ignore it - each spawn creates a new session
+        if (typeof options.resume === 'string' && options.resume.trim() && !supportsVendorResume(options.agent)) {
+          return {
+            type: 'error',
+            errorMessage: `Resume is not supported for agent '${options.agent}'.`,
+          };
+        }
+
+        // Vendor resume support (fork: Codex + Claude).
+        if (supportsVendorResume(options.agent) && typeof options.resume === 'string' && options.resume.trim()) {
+          args.push('--resume', options.resume.trim());
+        }
+
         const happyProcess = spawnHappyCLI(args, {
           cwd: directory,
           detached: true,  // Sessions stay alive when daemon stops

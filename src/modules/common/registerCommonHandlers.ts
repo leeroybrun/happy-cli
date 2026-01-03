@@ -122,6 +122,16 @@ export interface SpawnSessionOptions {
     approvedNewDirectoryCreation?: boolean;
     agent?: 'claude' | 'codex' | 'gemini';
     token?: string;
+    /**
+     * Resume an existing agent session by id (vendor resume).
+     *
+     * Upstream intent: Claude (`--resume <sessionId>`).
+     * This branch additionally supports Codex vendor resume (fork-only).
+     *
+     * If resume is requested for an unsupported agent, the daemon should return an error
+     * rather than silently spawning a fresh session.
+     */
+    resume?: string;
 }
 
 export type SpawnSessionResult =

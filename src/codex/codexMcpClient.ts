@@ -9,7 +9,9 @@ import type { CodexSessionConfig, CodexToolResponse } from './types';
 import { z } from 'zod';
 import { ElicitRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { CodexPermissionHandler } from './utils/permissionHandler';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
 
 const DEFAULT_TIMEOUT = 14 * 24 * 60 * 60 * 1000; // 14 days, which is the half of the maximum possible timeout (~28 days for int32 value in NodeJS)
 
@@ -19,12 +21,17 @@ const DEFAULT_TIMEOUT = 14 * 24 * 60 * 60 * 1000; // 14 days, which is the half 
  */
 function getCodexMcpCommand(): string {
     try {
-        const version = execSync('codex --version', { encoding: 'utf8' }).trim();
+        const codexBin = process.env.HAPPY_CODEX_BIN || 'codex';
+        const version = execFileSync(codexBin, ['--version'], { encoding: 'utf8' }).trim();
         const match = version.match(/codex-cli\s+(\d+\.\d+\.\d+(?:-alpha\.\d+)?)/);
         if (!match) return 'mcp-server'; // Default to newer command if we can't parse
 
         const versionStr = match[1];
         const [major, minor, patch] = versionStr.split(/[-.]/).map(Number);
+        if (major === 0 && minor === 0 && patch === 0) {
+            // Treat dev builds as unknown; prefer the newer subcommand (and we also retry fallback in connect()).
+            return 'mcp-server';
+        }
 
         // Version >= 0.43.0-alpha.5 has mcp-server
         if (major > 0 || minor > 43) return 'mcp-server';
@@ -81,29 +88,63 @@ export class CodexMcpClient {
         this.permissionHandler = handler;
     }
 
+    /**
+     * Provide a conversation/session identifier to resume via `codex-reply`.
+     * We intentionally set both `sessionId` and `conversationId` because different Codex MCP
+     * versions use slightly different naming, and our client historically required `sessionId`.
+     */
+    setResumedConversationId(conversationId: string): void {
+        this.sessionId = conversationId;
+        this.conversationId = conversationId;
+        logger.debug('[CodexMCP] Resumed conversation id set:', conversationId);
+    }
+
     async connect(): Promise<void> {
         if (this.connected) return;
 
-        const mcpCommand = getCodexMcpCommand();
-        logger.debug(`[CodexMCP] Connecting to Codex MCP server using command: codex ${mcpCommand}`);
+        // Ensure CODEX_HOME is stable so rollouts are discoverable when resuming.
+        if (!process.env.CODEX_HOME) {
+            process.env.CODEX_HOME = join(homedir(), '.codex');
+        }
 
-        this.transport = new StdioClientTransport({
-            command: 'codex',
-            args: [mcpCommand],
-            env: Object.keys(process.env).reduce((acc, key) => {
-                const value = process.env[key];
-                if (typeof value === 'string') acc[key] = value;
-                return acc;
-            }, {} as Record<string, string>)
-        });
+        const codexBin = process.env.HAPPY_CODEX_BIN || 'codex';
+        const mcpCommand = getCodexMcpCommand();
+
+        const connectWithCommand = async (command: string): Promise<boolean> => {
+            logger.debug(`[CodexMCP] Connecting to Codex MCP server using command: ${codexBin} ${command}`);
+            this.transport = new StdioClientTransport({
+                command: codexBin,
+                args: [command],
+                env: Object.keys(process.env).reduce((acc, key) => {
+                    const value = process.env[key];
+                    if (typeof value === 'string') acc[key] = value;
+                    return acc;
+                }, {} as Record<string, string>)
+            });
+
+            try {
+                await this.client.connect(this.transport);
+                this.connected = true;
+                logger.debug('[CodexMCP] Connected to Codex');
+                return true;
+            } catch (error) {
+                logger.debug(`[CodexMCP] Failed to connect with command "${command}":`, error);
+                this.transport = null;
+                return false;
+            }
+        };
 
         // Register request handlers for Codex permission methods
         this.registerPermissionHandlers();
 
-        await this.client.connect(this.transport);
-        this.connected = true;
-
-        logger.debug('[CodexMCP] Connected to Codex');
+        let connectedSuccessfully = await connectWithCommand(mcpCommand);
+        if (!connectedSuccessfully) {
+            const fallback = mcpCommand === 'mcp-server' ? 'mcp' : 'mcp-server';
+            connectedSuccessfully = await connectWithCommand(fallback);
+        }
+        if (!connectedSuccessfully) {
+            throw new Error('Failed to connect to Codex MCP server with either "mcp" or "mcp-server" subcommands.');
+        }
     }
 
     private registerPermissionHandlers(): void {
@@ -196,7 +237,12 @@ export class CodexMcpClient {
             logger.debug('[CodexMCP] conversationId missing, defaulting to sessionId:', this.conversationId);
         }
 
-        const args = { sessionId: this.sessionId, conversationId: this.conversationId, prompt };
+        const args = {
+            sessionId: this.sessionId,
+            conversationId: this.conversationId,
+            conversation_id: this.conversationId,
+            prompt
+        };
         logger.debug('[CodexMCP] Continuing Codex session:', args);
 
         const response = await this.client.callTool({
