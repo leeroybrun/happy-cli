@@ -1,6 +1,5 @@
 import fs from 'fs/promises';
 import os from 'os';
-import * as tmp from 'tmp';
 
 import { ApiClient } from '@/api/api';
 import { TrackedSession } from './types';
@@ -238,17 +237,14 @@ export async function startDaemon(): Promise<void> {
         let extraEnv: Record<string, string> = {};
         if (options.token) {
           if (options.agent === 'codex') {
-
-            // Create a temporary directory for Codex
-            const codexHomeDir = tmp.dirSync();
-
-            // Write the token to the temporary directory
-            fs.writeFile(join(codexHomeDir.name, 'auth.json'), options.token);
-
-            // Set the environment variable for Codex
-            extraEnv = {
-              CODEX_HOME: codexHomeDir.name
-            };
+            // Write auth.json into CODEX_HOME so Codex MCP can authenticate.
+            // Respect an already-configured CODEX_HOME (e.g. stack-scoped env) to keep stacks isolated.
+            const codexHomeDir = process.env.CODEX_HOME || join(os.homedir(), '.codex');
+            await fs.mkdir(codexHomeDir, { recursive: true });
+            await fs.writeFile(join(codexHomeDir, 'auth.json'), options.token);
+            // Only set CODEX_HOME for the child if it wasn't already set in our env.
+            // If it is set, it will be inherited via ...process.env below.
+            extraEnv = process.env.CODEX_HOME ? {} : { CODEX_HOME: codexHomeDir };
           } else { // Assuming claude
             extraEnv = {
               CLAUDE_CODE_OAUTH_TOKEN: options.token
@@ -281,8 +277,11 @@ export async function startDaemon(): Promise<void> {
           '--started-by', 'daemon'
         ];
 
-        // TODO: In future, sessionId could be used with --resume to continue existing sessions
-        // For now, we ignore it - each spawn creates a new session
+        // Resume support (Codex + Claude)
+        if (options.resume && typeof options.resume === 'string' && options.resume.trim()) {
+          args.push('--resume', options.resume.trim());
+        }
+
         const happyProcess = spawnHappyCLI(args, {
           cwd: directory,
           detached: true,  // Sessions stay alive when daemon stops
