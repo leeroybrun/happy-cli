@@ -4,6 +4,16 @@ Code on the go controlling claude code from your mobile device.
 
 Free. Open source. Code anywhere.
 
+## Fork additions (leeroybrun)
+
+This fork tracks upstream (`slopus/happy-cli`) and adds a few features used by **Happy Stacks**.
+
+- **Resume from UI (Claude + Codex)**: accepts a `resume` session id from the mobile/web UI and forwards it to the spawned agent via `--resume`.
+- **Codex resume by session id (codex-reply)**: allows resuming a Codex session from a session id using the `codex-reply` MCP tool.
+  - Requires a Codex build that provides the `codex-reply` MCP tool call. See: https://github.com/leeroybrun/codex/tree/feat/mcp-codex-reply-session-recovery
+  - Set `HAPPY_CODEX_BIN` to point at that Codex binary.
+- **Execpolicy approvals + MCP tool calls**: support for execpolicy approval flows and forwarding MCP tool calls (upstream PR: https://github.com/slopus/happy-cli/pull/102)
+
 ## Installation
 
 ```bash
@@ -44,6 +54,7 @@ This will:
 - `HAPPY_SERVER_URL` - Custom server URL (default: https://api.cluster-fluster.com)
 - `HAPPY_WEBAPP_URL` - Custom web app URL (default: https://app.happy.engineering)
 - `HAPPY_HOME_DIR` - Custom home directory for Happy data (default: ~/.happy)
+- `HAPPY_CODEX_BIN` - Path to the `codex` binary to use for Codex mode (useful for custom Codex builds)
 - `HAPPY_DISABLE_CAFFEINATE` - Disable macOS sleep prevention (set to `true`, `1`, or `yes`)
 - `HAPPY_EXPERIMENTAL` - Enable experimental features (set to `true`, `1`, or `yes`)
 
