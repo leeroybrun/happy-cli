@@ -14,6 +14,7 @@ import packageJson from '../../package.json';
 import { getEnvironmentInfo } from '@/ui/doctor';
 import { spawnHappyCLI } from '@/utils/spawnHappyCLI';
 import { writeDaemonState, DaemonLocallyPersistedState, readDaemonState, acquireDaemonLock, releaseDaemonLock, readSettings } from '@/persistence';
+import { supportsVendorResume } from '@/utils/agentCapabilities';
 
 import { cleanupDaemonState, isDaemonRunningCurrentlyInstalledHappyVersion, stopDaemon } from './controlClient';
 import { startDaemonControlServer } from './controlServer';
@@ -202,7 +203,7 @@ export async function startDaemon(): Promise<void> {
         environmentVariableKeys: envKeys,
       });
 
-      const { directory, sessionId, machineId, approvedNewDirectoryCreation = true } = options;
+      const { directory, sessionId, machineId, approvedNewDirectoryCreation = true, resume } = options;
       let directoryCreated = false;
 
       try {
@@ -360,7 +361,15 @@ export async function startDaemon(): Promise<void> {
           const cliPath = join(projectPath(), 'dist', 'index.mjs');
           // Determine agent command - support claude, codex, and gemini
           const agent = options.agent === 'gemini' ? 'gemini' : (options.agent === 'codex' ? 'codex' : 'claude');
-          const fullCommand = `node --no-warnings --no-deprecation ${cliPath} ${agent} --happy-starting-mode remote --started-by daemon`;
+          const normalizedResume = typeof resume === 'string' ? resume.trim() : '';
+          if (normalizedResume && !supportsVendorResume(options.agent)) {
+            return {
+              type: 'error',
+              errorMessage: `Resume is not supported for agent '${options.agent}'. (Upstream supports Claude vendor resume only.)`,
+            };
+          }
+          const resumeArg = normalizedResume ? ` --resume ${normalizedResume}` : '';
+          const fullCommand = `node --no-warnings --no-deprecation ${cliPath} ${agent} --happy-starting-mode remote --started-by daemon${resumeArg}`;
 
           // Spawn in tmux with environment variables
           // IMPORTANT: `spawnInTmux` uses `-e KEY=VALUE` flags for the window.
@@ -487,8 +496,19 @@ export async function startDaemon(): Promise<void> {
             '--started-by', 'daemon'
           ];
 
-          // TODO: In future, sessionId could be used with --resume to continue existing sessions
-          // For now, we ignore it - each spawn creates a new session
+          const normalizedResume = typeof resume === 'string' ? resume.trim() : '';
+          if (normalizedResume) {
+            if (!supportsVendorResume(options.agent)) {
+              return {
+                type: 'error',
+                errorMessage: `Resume is not supported for agent '${options.agent}'. (Upstream supports Claude vendor resume only.)`,
+              };
+            }
+
+            args.push('--resume', normalizedResume);
+          }
+
+          // NOTE: sessionId is reserved for future functionality; we currently ignore it.
           const happyProcess = spawnHappyCLI(args, {
             cwd: directory,
             detached: true,  // Sessions stay alive when daemon stops
