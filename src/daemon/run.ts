@@ -186,7 +186,7 @@ export async function startDaemon(): Promise<void> {
     const spawnSession = async (options: SpawnSessionOptions): Promise<SpawnSessionResult> => {
       logger.debugLargeJson('[DAEMON RUN] Spawning session', options);
 
-      const { directory, sessionId, machineId, approvedNewDirectoryCreation = true } = options;
+      const { directory, sessionId, machineId, approvedNewDirectoryCreation = true, resume } = options;
       let directoryCreated = false;
 
       try {
@@ -281,8 +281,13 @@ export async function startDaemon(): Promise<void> {
           '--started-by', 'daemon'
         ];
 
-        // TODO: In future, sessionId could be used with --resume to continue existing sessions
-        // For now, we ignore it - each spawn creates a new session
+        // Resume support (Claude only, upstream-friendly).
+        // Claude supports `--resume <sessionId>` for continuing an existing session.
+        if ((options.agent === 'claude' || options.agent === undefined) && typeof resume === 'string' && resume.trim()) {
+          args.push('--resume', resume.trim());
+        }
+
+        // NOTE: sessionId is reserved for future functionality; we currently ignore it.
         const happyProcess = spawnHappyCLI(args, {
           cwd: directory,
           detached: true,  // Sessions stay alive when daemon stops

@@ -119,6 +119,11 @@ export interface SpawnSessionOptions {
     machineId?: string;
     directory: string;
     sessionId?: string;
+    /**
+     * Resume an existing agent session by id.
+     * For upstream usage this is intended for Claude (`--resume <sessionId>`).
+     */
+    resume?: string;
     approvedNewDirectoryCreation?: boolean;
     agent?: 'claude' | 'codex' | 'gemini';
     token?: string;
