@@ -20,6 +20,7 @@ import { startDaemonControlServer } from './controlServer';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { projectPath } from '@/projectPath';
+import { canAgentResume } from '@/utils/agentCapabilities';
 
 // Prepare initial metadata
 export const initialMachineMetadata: MachineMetadata = {
@@ -186,7 +187,7 @@ export async function startDaemon(): Promise<void> {
     const spawnSession = async (options: SpawnSessionOptions): Promise<SpawnSessionResult> => {
       logger.debugLargeJson('[DAEMON RUN] Spawning session', options);
 
-      const { directory, sessionId, machineId, approvedNewDirectoryCreation = true, resume } = options;
+      const { directory, sessionId, machineId, approvedNewDirectoryCreation = true, resume, existingSessionId, initialMessage } = options;
       let directoryCreated = false;
 
       try {
@@ -281,20 +282,33 @@ export async function startDaemon(): Promise<void> {
           '--started-by', 'daemon'
         ];
 
-        // Resume support (Claude only, upstream-friendly).
+        // Resume support for agents that support it (configured in agentCapabilities).
         // Claude supports `--resume <sessionId>` for continuing an existing session.
-        if ((options.agent === 'claude' || options.agent === undefined) && typeof resume === 'string' && resume.trim()) {
+        // Codex resume requires a custom build (fork-only by default).
+        if (canAgentResume(options.agent) && typeof resume === 'string' && resume.trim()) {
           args.push('--resume', resume.trim());
         }
 
-        // NOTE: sessionId is reserved for future functionality; we currently ignore it.
+        // Existing session ID for reconnecting to an inactive session
+        if (typeof existingSessionId === 'string' && existingSessionId.trim()) {
+          args.push('--existing-session', existingSessionId.trim());
+        }
+
+        // Initial message to send after resuming (passed via environment to avoid shell escaping issues)
+        let extraEnvWithMessage = extraEnv;
+        if (typeof initialMessage === 'string' && initialMessage.trim()) {
+          extraEnvWithMessage = {
+            ...extraEnv,
+            HAPPY_INITIAL_MESSAGE: initialMessage
+          };
+        }
         const happyProcess = spawnHappyCLI(args, {
           cwd: directory,
           detached: true,  // Sessions stay alive when daemon stops
           stdio: ['ignore', 'pipe', 'pipe'],  // Capture stdout/stderr for debugging
           env: {
             ...process.env,
-            ...extraEnv
+            ...extraEnvWithMessage
           }
         });
 

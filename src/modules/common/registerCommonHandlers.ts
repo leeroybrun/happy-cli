@@ -124,13 +124,22 @@ export interface SpawnSessionOptions {
      * For upstream usage this is intended for Claude (`--resume <sessionId>`).
      */
     resume?: string;
+    /**
+     * Existing Happy session ID to reconnect to (for inactive session resume).
+     * When set, the CLI will connect to this session instead of creating a new one.
+     */
+    existingSessionId?: string;
+    /**
+     * Initial message to send after resuming an inactive session.
+     */
+    initialMessage?: string;
     approvedNewDirectoryCreation?: boolean;
     agent?: 'claude' | 'codex' | 'gemini';
     token?: string;
 }
 
 export type SpawnSessionResult =
-    | { type: 'success'; sessionId: string }
+    | { type: 'success'; sessionId?: string }
     | { type: 'requestToApproveDirectoryCreation'; directory: string }
     | { type: 'error'; errorMessage: string };
 

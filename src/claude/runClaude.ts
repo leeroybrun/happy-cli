@@ -33,6 +33,12 @@ export interface StartOptions {
     claudeEnvVars?: Record<string, string>
     claudeArgs?: string[]
     startedBy?: 'daemon' | 'terminal'
+    /**
+     * Existing Happy session ID to reconnect to.
+     * When set, the CLI will connect to this session instead of creating a new one.
+     * Used for resuming inactive sessions.
+     */
+    existingSessionId?: string
 }
 
 export async function runClaude(credentials: Credentials, options: StartOptions = {}): Promise<void> {
@@ -93,8 +99,27 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         lifecycleStateSince: Date.now(),
         flavor: 'claude'
     };
-    const response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
-    logger.debug(`Session created: ${response.id}`);
+
+    // Handle existing session (for inactive session resume) vs new session
+    let response: { id: string };
+    if (options.existingSessionId) {
+        // Resuming an inactive session - use the existing session ID
+        logger.debug(`[START] Resuming existing session: ${options.existingSessionId}`);
+        response = { id: options.existingSessionId };
+
+        // Update the session metadata to mark it as active again
+        const sessionClient = api.sessionSyncClient(response);
+        sessionClient.updateMetadata((currentMetadata) => ({
+            ...currentMetadata,
+            ...metadata,
+            lifecycleState: 'running',
+            lifecycleStateSince: Date.now(),
+        }));
+    } else {
+        // Creating a new session
+        response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
+        logger.debug(`Session created: ${response.id}`);
+    }
 
     // Always report to daemon if it exists
     try {
@@ -375,6 +400,22 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     });
 
     registerKillSessionHandler(session.rpcHandlerManager, cleanup);
+
+    // Queue initial message if provided (for inactive session resume)
+    const initialMessage = process.env.HAPPY_INITIAL_MESSAGE;
+    if (initialMessage) {
+        logger.debug(`[START] Queuing initial message for resumed session: ${initialMessage.substring(0, 50)}...`);
+        const initialEnhancedMode: EnhancedMode = {
+            permissionMode: currentPermissionMode,
+            model: currentModel,
+            fallbackModel: currentFallbackModel,
+            customSystemPrompt: currentCustomSystemPrompt,
+            appendSystemPrompt: currentAppendSystemPrompt,
+            allowedTools: currentAllowedTools,
+            disallowedTools: currentDisallowedTools
+        };
+        messageQueue.push(initialMessage, initialEnhancedMode);
+    }
 
     // Create claude loop
     await loop({

@@ -105,6 +105,38 @@ export class ApiMachineClient {
             const { directory, sessionId, machineId, approvedNewDirectoryCreation, agent, token, resume } = params || {};
             logger.debug(`[API MACHINE] Spawning session with params: ${JSON.stringify(params)}`);
 
+            // Handle resume-session type for inactive session resumption
+            if (params?.type === 'resume-session') {
+                const { sessionId: existingSessionId, directory, agent, agentSessionId, message } = params;
+                logger.debug(`[API MACHINE] Resuming inactive session ${existingSessionId}`);
+
+                if (!directory) {
+                    throw new Error('Directory is required');
+                }
+                if (!existingSessionId) {
+                    throw new Error('Session ID is required for resume');
+                }
+                if (!agentSessionId) {
+                    throw new Error('Agent session ID is required for resume');
+                }
+
+                const result = await spawnSession({
+                    directory,
+                    agent,
+                    resume: agentSessionId,
+                    existingSessionId,
+                    initialMessage: message,
+                    approvedNewDirectoryCreation: true
+                });
+
+                if (result.type === 'error') {
+                    throw new Error(result.errorMessage);
+                }
+
+                // For resume, we don't return a new session ID - we're reusing the existing one
+                return { type: 'success' };
+            }
+
             if (!directory) {
                 throw new Error('Directory is required');
             }

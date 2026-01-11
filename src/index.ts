@@ -406,6 +406,9 @@ ${chalk.bold('To clean up runaway processes:')} Use ${chalk.cyan('happy doctor c
         unknownArgs.push('--dangerously-skip-permissions')
       } else if (arg === '--started-by') {
         options.startedBy = args[++i] as 'daemon' | 'terminal'
+      } else if (arg === '--existing-session') {
+        // Used by daemon to reconnect to an existing session (for inactive session resume)
+        options.existingSessionId = args[++i]
       } else if (arg === '--claude-env') {
         // Parse KEY=VALUE environment variable to pass to Claude
         const envArg = args[++i]
