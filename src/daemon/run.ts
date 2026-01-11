@@ -203,7 +203,9 @@ export async function startDaemon(): Promise<void> {
         environmentVariableKeys: envKeys,
       });
 
-      const { directory, sessionId, machineId, approvedNewDirectoryCreation = true, resume } = options;
+      const { directory, sessionId, machineId, approvedNewDirectoryCreation = true, resume, existingSessionId, initialMessage } = options;
+      const normalizedResume = typeof resume === 'string' ? resume.trim() : '';
+      const normalizedExistingSessionId = typeof existingSessionId === 'string' ? existingSessionId.trim() : '';
       let directoryCreated = false;
 
       try {
@@ -350,6 +352,14 @@ export async function startDaemon(): Promise<void> {
           }
         }
 
+        // Fail closed if caller requests inactive-session resume for an unsupported agent.
+        // Upstream policy: Claude-only (vendor resume support).
+        if ((normalizedResume || normalizedExistingSessionId) && !supportsVendorResume(options.agent)) {
+          return {
+            type: 'error',
+            errorMessage: `Resume is not supported for agent '${options.agent}'.`,
+          };
+        }
         if (useTmux && tmuxSessionName !== undefined) {
           // Try to spawn in tmux session
           const sessionDesc = tmuxSessionName || 'current/most recent session';
@@ -361,22 +371,21 @@ export async function startDaemon(): Promise<void> {
           const cliPath = join(projectPath(), 'dist', 'index.mjs');
           // Determine agent command - support claude, codex, and gemini
           const agent = options.agent === 'gemini' ? 'gemini' : (options.agent === 'codex' ? 'codex' : 'claude');
-          const normalizedResume = typeof resume === 'string' ? resume.trim() : '';
-          if (normalizedResume && !supportsVendorResume(options.agent)) {
-            return {
-              type: 'error',
-              errorMessage: `Resume is not supported for agent '${options.agent}'. (Upstream supports Claude vendor resume only.)`,
-            };
-          }
           const resumeArg = normalizedResume ? ` --resume ${normalizedResume}` : '';
-          const fullCommand = `node --no-warnings --no-deprecation ${cliPath} ${agent} --happy-starting-mode remote --started-by daemon${resumeArg}`;
+          const existingSessionArg = normalizedExistingSessionId ? ` --existing-session ${normalizedExistingSessionId}` : '';
+          const fullCommand = `node --no-warnings --no-deprecation ${cliPath} ${agent} --happy-starting-mode remote --started-by daemon${resumeArg}${existingSessionArg}`;
 
           // Spawn in tmux with environment variables
           // IMPORTANT: `spawnInTmux` uses `-e KEY=VALUE` flags for the window.
           // Pass ONLY variables we want to override for the spawned agent (extraEnv),
           // not the entire daemon process.env (which can be huge and may exceed tmux command limits).
           const windowName = `happy-${Date.now()}-${agent}`;
-          const tmuxEnv: Record<string, string> = { ...extraEnv };
+          const tmuxEnv: Record<string, string> = {
+            ...extraEnv,
+            ...(typeof initialMessage === 'string' && initialMessage.trim()
+              ? { HAPPY_INITIAL_MESSAGE: initialMessage }
+              : {}),
+          };
 
           const tmuxResult = await tmux.spawnInTmux([fullCommand], {
             sessionName: tmuxSessionName,
@@ -496,17 +505,19 @@ export async function startDaemon(): Promise<void> {
             '--started-by', 'daemon'
           ];
 
-          const normalizedResume = typeof resume === 'string' ? resume.trim() : '';
           if (normalizedResume) {
-            if (!supportsVendorResume(options.agent)) {
-              return {
-                type: 'error',
-                errorMessage: `Resume is not supported for agent '${options.agent}'. (Upstream supports Claude vendor resume only.)`,
-              };
-            }
-
             args.push('--resume', normalizedResume);
           }
+
+          // Existing session ID for reconnecting to an inactive session.
+          if (normalizedExistingSessionId) {
+            args.push('--existing-session', normalizedExistingSessionId);
+          }
+
+          // Initial message to send after resuming (passed via environment to avoid shell escaping issues)
+          const extraEnvWithMessage = typeof initialMessage === 'string' && initialMessage.trim()
+            ? { ...extraEnv, HAPPY_INITIAL_MESSAGE: initialMessage }
+            : extraEnv;
 
           // NOTE: sessionId is reserved for future functionality; we currently ignore it.
           const happyProcess = spawnHappyCLI(args, {
@@ -515,7 +526,7 @@ export async function startDaemon(): Promise<void> {
             stdio: ['ignore', 'pipe', 'pipe'],  // Capture stdout/stderr for debugging
             env: {
               ...process.env,
-              ...extraEnv
+              ...extraEnvWithMessage
             }
           });
 
