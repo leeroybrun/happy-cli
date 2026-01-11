@@ -20,7 +20,7 @@ export type AgentType = 'claude' | 'codex' | 'gemini';
  */
 export const RESUMABLE_AGENTS: AgentType[] = [
     'claude',
-    // 'codex', // Fork: uncomment to enable Codex resume (requires custom Codex build)
+    'codex', // Fork: Codex resume enabled (requires custom Codex build with MCP resume)
 ];
 
 /**

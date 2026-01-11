@@ -22,12 +22,14 @@ import { startHappyServer } from '@/claude/utils/startHappyServer';
 import { MessageBuffer } from "@/ui/ink/messageBuffer";
 import { CodexDisplay } from "@/ui/ink/CodexDisplay";
 import { trimIdent } from "@/utils/trimIdent";
-import type { CodexSessionConfig } from './types';
+import type { CodexSessionConfig, CodexToolResponse } from './types';
 import { CHANGE_TITLE_INSTRUCTION } from '@/gemini/constants';
 import { notifyDaemonSessionStarted } from "@/daemon/controlClient";
 import { registerKillSessionHandler } from "@/claude/registerKillSessionHandler";
 import { delay } from "@/utils/time";
 import { stopCaffeinate } from "@/utils/caffeinate";
+import { formatErrorForUi } from "@/utils/formatErrorForUi";
+import { parseSpecialCommand } from '@/parsers/specialCommands';
 
 type ReadyEventOptions = {
     pending: unknown;
@@ -63,6 +65,7 @@ export function emitReadyIfIdle({ pending, queueSize, shouldExit, sendReady, not
 export async function runCodex(opts: {
     credentials: Credentials;
     startedBy?: 'daemon' | 'terminal';
+    resume?: string;
 }): Promise<void> {
     type PermissionMode = 'default' | 'read-only' | 'safe-yolo' | 'yolo';
     interface EnhancedMode {
@@ -176,7 +179,13 @@ export async function runCodex(opts: {
             permissionMode: messagePermissionMode || 'default',
             model: messageModel,
         };
-        messageQueue.push(message.content.text, enhancedMode);
+
+        const specialCommand = parseSpecialCommand(message.content.text);
+        if (specialCommand.type === 'clear') {
+            messageQueue.pushIsolateAndClear(message.content.text, enhancedMode);
+        } else {
+            messageQueue.push(message.content.text, enhancedMode);
+        }
     });
     let thinking = false;
     session.keepAlive(thinking, 'remote');
@@ -240,12 +249,9 @@ export async function runCodex(opts: {
                 storedSessionIdForResume = client.storeSessionForResume();
                 logger.debug('[Codex] Stored session for resume:', storedSessionIdForResume);
             }
-            
+
             abortController.abort();
-            messageQueue.reset();
-            permissionHandler.reset();
             reasoningProcessor.abort();
-            diffProcessor.reset();
             logger.debug('[Codex] Abort completed - session remains active');
         } catch (error) {
             logger.debug('[Codex] Error during abort:', error);
@@ -275,11 +281,18 @@ export async function runCodex(opts: {
                     archivedBy: 'cli',
                     archiveReason: 'User terminated'
                 }));
-                
+
                 // Send session death message
                 session.sendSessionDeath();
                 await session.flush();
                 await session.close();
+            }
+
+            // Force close Codex transport (best-effort) so we don't leave stray processes
+            try {
+                await client.forceCloseSession();
+            } catch (e) {
+                logger.debug('[Codex] Error while force closing Codex session during termination', e);
             }
 
             // Stop caffeinate
@@ -339,6 +352,64 @@ export async function runCodex(opts: {
     //
 
     const client = new CodexMcpClient();
+    /**
+     * Some Codex MCP deployments stream `task_complete` / `turn_aborted` events but
+     * do not reliably resolve the underlying MCP tool call (`codex` / `codex-reply`).
+     *
+     * If we await the tool call forever, the main loop never returns to
+     * `MessageQueue2.waitForMessages...` and new user messages get queued but never
+     * processed.
+     *
+     * To keep the session responsive, we abort the in-flight MCP tool call when we
+     * observe a terminal event for the turn.
+     */
+    let inFlightToolAbortController: AbortController | null = null;
+    let inFlightToolAbortTimer: NodeJS.Timeout | null = null;
+    let lastTurnTerminalEvent: 'task_complete' | 'turn_aborted' | null = null;
+
+    function isAbortError(error: unknown): boolean {
+        return error instanceof Error && error.name === 'AbortError';
+    }
+
+    function scheduleAbortInFlightToolCall(reason: string, controller: AbortController): void {
+        if (inFlightToolAbortTimer) {
+            clearTimeout(inFlightToolAbortTimer);
+            inFlightToolAbortTimer = null;
+        }
+        // Give Codex MCP a short chance to resolve the tool call naturally after emitting a terminal event.
+        // Some deployments never resolve, which deadlocks the main loop unless we abort.
+        inFlightToolAbortTimer = setTimeout(() => {
+            // Only abort the exact in-flight controller that was active when we scheduled this timer.
+            // Codex may deliver terminal events late (after the tool call finished); in that case we
+            // must not abort a subsequent turn's tool call.
+            if (inFlightToolAbortController === controller && !controller.signal.aborted) {
+                logger.debug(`[Codex] Aborting in-flight tool call (${reason}) after terminal event grace period`);
+                controller.abort();
+            }
+        }, 1000);
+    }
+
+    function anyAbortSignal(signals: AbortSignal[]): AbortSignal {
+        const anyFn = (AbortSignal as any)?.any;
+        if (typeof anyFn === 'function') {
+            return anyFn(signals);
+        }
+        // Fallback for older runtimes: best-effort "any" signal (listener cleanup omitted).
+        const controller = new AbortController();
+        const onAbort = () => controller.abort();
+        for (const s of signals) {
+            if (s.aborted) {
+                controller.abort();
+                break;
+            }
+            try {
+                s.addEventListener('abort', onAbort, { once: true });
+            } catch {
+                // ignore
+            }
+        }
+        return controller.signal;
+    }
 
     // Helper: find Codex session transcript for a given sessionId
     function findCodexResumeFile(sessionId: string | null): string | null {
@@ -391,12 +462,65 @@ export async function runCodex(opts: {
         session.sendCodexMessage(message);
     });
     client.setPermissionHandler(permissionHandler);
+
+    function extractCodexToolErrorText(response: CodexToolResponse): string | null {
+        if (!response?.isError) {
+            return null;
+        }
+        const text = (response.content || [])
+            .map((c) => (c && typeof c.text === 'string' ? c.text : ''))
+            .filter(Boolean)
+            .join('\n')
+            .trim();
+        return text || 'Codex error';
+    }
+
+    function forwardCodexStatusToUi(messageText: string): void {
+        messageBuffer.addMessage(messageText, 'status');
+        session.sendSessionEvent({ type: 'message', message: messageText });
+    }
+
+    function forwardCodexErrorToUi(errorText: string): void {
+        forwardCodexStatusToUi(`Codex error: ${errorText}`);
+    }
+
     client.setHandler((msg) => {
         logger.debug(`[Codex] MCP message: ${JSON.stringify(msg)}`);
+
+        if (msg?.type === 'session_configured') {
+            const nextId =
+                (msg as any)?.session_id
+                ?? (msg as any)?.sessionId
+                ?? (msg as any)?.session_id
+                ?? (msg as any)?.sessionId;
+            if (typeof nextId === 'string' && nextId) {
+                session.updateMetadata((currentMetadata) => {
+                    if (currentMetadata.codexSessionId) {
+                        return currentMetadata;
+                    }
+                    return {
+                        ...currentMetadata,
+                        codexSessionId: nextId,
+                    };
+                });
+            }
+        }
 
         // Add messages to the ink UI buffer based on message type
         if (msg.type === 'agent_message') {
             messageBuffer.addMessage(msg.message, 'assistant');
+        } else if (msg.type === 'error') {
+            const errorText = typeof msg.message === 'string' && msg.message.trim() ? msg.message.trim() : 'Codex error';
+            forwardCodexErrorToUi(errorText);
+        } else if (msg.type === 'stream_error') {
+            const status = typeof msg.message === 'string' && msg.message.trim() ? msg.message.trim() : 'Codex stream error';
+            forwardCodexStatusToUi(`Codex stream error: ${status}`);
+        } else if (msg.type === 'mcp_startup_update') {
+            if (msg.status?.state === 'failed') {
+                const errorText = typeof msg.status?.error === 'string' ? msg.status.error : 'MCP server failed to start';
+                const serverName = typeof msg.server === 'string' ? msg.server : 'unknown';
+                forwardCodexStatusToUi(`MCP server "${serverName}" failed to start: ${errorText}`);
+            }
         } else if (msg.type === 'agent_reasoning_delta') {
             // Skip reasoning deltas in the UI to reduce noise
         } else if (msg.type === 'agent_reasoning') {
@@ -413,9 +537,19 @@ export async function runCodex(opts: {
         } else if (msg.type === 'task_started') {
             messageBuffer.addMessage('Starting task...', 'status');
         } else if (msg.type === 'task_complete') {
+            // Only schedule aborts when a tool call is actually in-flight.
+            // Codex can deliver terminal events late (after we already returned to idle).
+            if (inFlightToolAbortController) {
+                lastTurnTerminalEvent = 'task_complete';
+                scheduleAbortInFlightToolCall('task_complete', inFlightToolAbortController);
+            }
             messageBuffer.addMessage('Task completed', 'status');
             sendReady();
         } else if (msg.type === 'turn_aborted') {
+            if (inFlightToolAbortController) {
+                lastTurnTerminalEvent = 'turn_aborted';
+                scheduleAbortInFlightToolCall('turn_aborted', inFlightToolAbortController);
+            }
             messageBuffer.addMessage('Turn aborted', 'status');
             sendReady();
         }
@@ -433,7 +567,8 @@ export async function runCodex(opts: {
                 thinking = false;
                 session.keepAlive(thinking, 'remote');
             }
-            // Reset diff processor on task end or abort
+            // Emit final diff for the turn (once), then reset
+            diffProcessor.flush();
             diffProcessor.reset();
         }
         if (msg.type === 'agent_reasoning_section_break') {
@@ -507,6 +642,7 @@ export async function runCodex(opts: {
 
             // Add UI feedback for completion
             if (success) {
+                diffProcessor.markPatchApplied();
                 const message = stdout || 'Files modified successfully';
                 messageBuffer.addMessage(message.substring(0, 200), 'result');
             } else {
@@ -532,6 +668,29 @@ export async function runCodex(opts: {
                 diffProcessor.processDiff(msg.unified_diff);
             }
         }
+        // Handle MCP tool calls (e.g., change_title from happy server)
+        if (msg.type === 'mcp_tool_call_begin') {
+            const { call_id, invocation } = msg;
+            // Use mcp__ prefix so frontend recognizes it as MCP tool (minimal display)
+            const toolName = `mcp__${invocation.server}__${invocation.tool}`;
+            session.sendCodexMessage({
+                type: 'tool-call',
+                name: toolName,
+                callId: call_id,
+                input: invocation.arguments || {},
+                id: randomUUID()
+            });
+        }
+        if (msg.type === 'mcp_tool_call_end') {
+            const { call_id, result } = msg;
+            const output = result?.Ok || result?.Err || result;
+            session.sendCodexMessage({
+                type: 'tool-call-result',
+                callId: call_id,
+                output: output,
+                id: randomUUID()
+            });
+        }
     });
 
     // Start Happy MCP server (HTTP) and prepare STDIO bridge config for Codex
@@ -550,6 +709,13 @@ export async function runCodex(opts: {
         await client.connect();
         logger.debug('[codex]: client.connect done');
         let wasCreated = false;
+        if (opts.resume && opts.resume.trim()) {
+            const resumeId = opts.resume.trim();
+            client.setResumedConversationId(resumeId);
+            wasCreated = true;
+            first = false;
+            messageBuffer.addMessage(`Resuming Codex session ${resumeId.substring(0, 8)}…`, 'status');
+        }
         let currentModeHash: string | null = null;
         let pending: { message: string; mode: EnhancedMode; isolate: boolean; hash: string } | null = null;
         // If we restart (e.g., mode change), use this to carry a resume file
@@ -563,6 +729,9 @@ export async function runCodex(opts: {
             if (!message) {
                 // Capture the current signal to distinguish idle-abort from queue close
                 const waitSignal = abortController.signal;
+                // If there are server-side pending messages, materialize one into the transcript now.
+                // This ensures sessions remain responsive even when the UI defers message creation.
+                await session.popPendingMessage();
                 const batch = await messageQueue.waitForMessagesAndGetAsString(waitSignal);
                 if (!batch) {
                     // If wait was aborted (e.g., remote abort with no active inference), ignore and continue
@@ -616,6 +785,30 @@ export async function runCodex(opts: {
             messageBuffer.addMessage(message.message, 'user');
             currentModeHash = message.hash;
 
+            const specialCommand = parseSpecialCommand(message.message);
+            if (specialCommand.type === 'clear') {
+                logger.debug('[Codex] Handling /clear command - resetting session');
+                client.clearSession();
+                wasCreated = false;
+                currentModeHash = null;
+
+                // Reset processors/permissions
+                permissionHandler.reset();
+                reasoningProcessor.abort();
+                diffProcessor.reset();
+                thinking = false;
+                session.keepAlive(thinking, 'remote');
+
+                messageBuffer.addMessage('Session reset.', 'status');
+                emitReadyIfIdle({
+                    pending,
+                    queueSize: () => messageQueue.size(),
+                    shouldExit,
+                    sendReady,
+                });
+                continue;
+            }
+
             try {
                 // Map permission mode to approval policy and sandbox for startSession
                 const approvalPolicy = (() => {
@@ -635,6 +828,13 @@ export async function runCodex(opts: {
                     }
                 })();
 
+                // Per-turn terminal state + per-tool-call abort controller. We may abort the MCP tool call
+                // after terminal events to avoid getting stuck if Codex does not resolve the tool response.
+                lastTurnTerminalEvent = null;
+                const toolAbortController = new AbortController();
+                inFlightToolAbortController = toolAbortController;
+                const toolSignal = anyAbortSignal([abortController.signal, toolAbortController.signal]);
+
                 if (!wasCreated) {
                     const startConfig: CodexSessionConfig = {
                         prompt: first ? message.message + '\n\n' + CHANGE_TITLE_INSTRUCTION : message.message,
@@ -645,10 +845,10 @@ export async function runCodex(opts: {
                     if (message.mode.model) {
                         startConfig.model = message.mode.model;
                     }
-                    
+
                     // Check for resume file from multiple sources
                     let resumeFile: string | null = null;
-                    
+
                     // Priority 1: Explicit resume file from mode change
                     if (nextExperimentalResume) {
                         resumeFile = nextExperimentalResume;
@@ -665,40 +865,61 @@ export async function runCodex(opts: {
                         }
                         storedSessionIdForResume = null; // consume once
                     }
-                    
+
                     // Apply resume file if found
                     if (resumeFile) {
                         (startConfig.config as any).experimental_resume = resumeFile;
                     }
-                    
-                    await client.startSession(
+                    const startResponse = await client.startSession(
                         startConfig,
-                        { signal: abortController.signal }
+                        { signal: toolSignal }
                     );
+                    const startError = extractCodexToolErrorText(startResponse);
+                    if (startError) {
+                        forwardCodexErrorToUi(startError);
+                        client.clearSession();
+                        wasCreated = false;
+                        currentModeHash = null;
+                        continue;
+                    }
                     wasCreated = true;
                     first = false;
                 } else {
                     const response = await client.continueSession(
                         message.message,
-                        { signal: abortController.signal }
+                        { signal: toolSignal }
                     );
                     logger.debug('[Codex] continueSession response:', response);
+                    const continueError = extractCodexToolErrorText(response);
+                    if (continueError) {
+                        forwardCodexErrorToUi(continueError);
+                        client.clearSession();
+                        wasCreated = false;
+                        currentModeHash = null;
+                        continue;
+                    }
                 }
             } catch (error) {
                 logger.warn('Error in codex session:', error);
-                const isAbortError = error instanceof Error && error.name === 'AbortError';
-                
-                if (isAbortError) {
+                const isAbort = isAbortError(error);
+
+                // If we aborted the MCP tool call after Codex already finished the turn, don't
+                // surface it as a user abort. This keeps the queue consumer alive.
+                if (isAbort && lastTurnTerminalEvent === 'task_complete') {
+                    logger.debug('[Codex] Ignoring AbortError triggered by task_complete');
+                } else if (isAbort && lastTurnTerminalEvent === 'turn_aborted') {
+                    logger.debug('[Codex] Ignoring AbortError triggered by turn_aborted');
+                } else if (isAbort) {
                     messageBuffer.addMessage('Aborted by user', 'status');
                     session.sendSessionEvent({ type: 'message', message: 'Aborted by user' });
-                    // Session was already stored in handleAbort(), no need to store again
-                    // Mark session as not created to force proper resume on next message
-                    wasCreated = false;
-                    currentModeHash = null;
-                    logger.debug('[Codex] Marked session as not created after abort for proper resume');
+                    // Abort cancels the current task/inference but keeps the Codex session alive.
+                    // Do not clear session state here; the next user message should continue on the
+                    // existing session if possible.
                 } else {
-                    messageBuffer.addMessage('Process exited unexpectedly', 'status');
-                    session.sendSessionEvent({ type: 'message', message: 'Process exited unexpectedly' });
+                    const details = formatErrorForUi(error);
+                    const messageText = `Codex process error: ${details}`;
+                    messageBuffer.addMessage(messageText, 'status');
+                    session.sendSessionEvent({ type: 'message', message: messageText });
                     // For unexpected exits, try to store session for potential recovery
                     if (client.hasActiveSession()) {
                         storedSessionIdForResume = client.storeSessionForResume();
@@ -706,18 +927,28 @@ export async function runCodex(opts: {
                     }
                 }
             } finally {
+                inFlightToolAbortController = null;
+                lastTurnTerminalEvent = null;
+                if (inFlightToolAbortTimer) {
+                    clearTimeout(inFlightToolAbortTimer);
+                    inFlightToolAbortTimer = null;
+                }
                 // Reset permission handler, reasoning processor, and diff processor
                 permissionHandler.reset();
                 reasoningProcessor.abort();  // Use abort to properly finish any in-progress tool calls
+                diffProcessor.flush();
                 diffProcessor.reset();
                 thinking = false;
                 session.keepAlive(thinking, 'remote');
-                emitReadyIfIdle({
-                    pending,
-                    queueSize: () => messageQueue.size(),
-                    shouldExit,
-                    sendReady,
-                });
+                const popped = !shouldExit ? await session.popPendingMessage() : false;
+                if (!popped) {
+                    emitReadyIfIdle({
+                        pending,
+                        queueSize: () => messageQueue.size(),
+                        shouldExit,
+                        sendReady,
+                    });
+                }
                 logActiveHandles('after-turn');
             }
         }
@@ -738,9 +969,9 @@ export async function runCodex(opts: {
         } catch (e) {
             logger.debug('[codex]: Error while closing session', e);
         }
-        logger.debug('[codex]: client.disconnect begin');
-        await client.disconnect();
-        logger.debug('[codex]: client.disconnect done');
+        logger.debug('[codex]: client.forceCloseSession begin');
+        await client.forceCloseSession();
+        logger.debug('[codex]: client.forceCloseSession done');
         // Stop Happy MCP server
         logger.debug('[codex]: happyServer.stop');
         happyServer.stop();

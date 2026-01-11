@@ -136,6 +136,7 @@ export interface SpawnSessionOptions {
     approvedNewDirectoryCreation?: boolean;
     agent?: 'claude' | 'codex' | 'gemini';
     token?: string;
+    resume?: string;
 }
 
 export type SpawnSessionResult =
