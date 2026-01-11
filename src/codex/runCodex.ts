@@ -194,6 +194,17 @@ export async function runCodex(opts: {
         session.keepAlive(thinking, 'remote');
     }, 2000);
 
+    // Wake the agent when the UI enqueues a server-side pending message while we're idle.
+    // Otherwise the agent can be blocked waiting for a normal transcript message and never call pending-pop.
+    session.on('ephemeral', (evt: any) => {
+        if (!evt || evt.type !== 'pending-queue') return;
+        if (evt.id !== session.sessionId) return;
+        if (typeof evt.count !== 'number' || evt.count <= 0) return;
+        if (thinking) return;
+        if (messageQueue.size() !== 0) return;
+        void session.popPendingMessage();
+    });
+
     const sendReady = () => {
         session.sendSessionEvent({ type: 'ready' });
         try {

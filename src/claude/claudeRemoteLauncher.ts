@@ -105,6 +105,17 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         (logMessage) => session.client.sendClaudeSessionMessage(logMessage)
     );
 
+    // Wake Claude when the UI enqueues a server-side pending message while we're idle.
+    // Otherwise the remote runner can be blocked waiting for a normal transcript message and never call pending-pop.
+    session.client.on('ephemeral', (evt: any) => {
+        if (!evt || evt.type !== 'pending-queue') return;
+        if (evt.id !== session.client.sessionId) return;
+        if (typeof evt.count !== 'number' || evt.count <= 0) return;
+        if (session.thinking) return;
+        if (session.queue.size() !== 0) return;
+        void session.client.popPendingMessage();
+    });
+
     // Set up callback to release delayed messages when permission is requested
     permissionHandler.setOnPermissionRequest((toolCallId: string) => {
         messageQueue.releaseToolCall(toolCallId);

@@ -140,6 +140,15 @@ export class ApiSessionClient extends EventEmitter {
             }
         });
 
+        // Ephemeral events (transient updates like activity / pending queue count)
+        this.socket.on('ephemeral', (data: any) => {
+            try {
+                this.emit('ephemeral', data);
+            } catch (error) {
+                logger.debug('[SOCKET] [EPHEMERAL] [ERROR] Error handling ephemeral', { error });
+            }
+        });
+
         // DEATH
         this.socket.on('error', (error) => {
             logger.debug('[API] Socket error:', error);

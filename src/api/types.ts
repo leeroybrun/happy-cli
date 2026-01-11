@@ -90,7 +90,10 @@ export interface ServerToClientEvents {
   'rpc-registered': (data: { method: string }) => void
   'rpc-unregistered': (data: { method: string }) => void
   'rpc-error': (data: { type: string, error: string }) => void
-  ephemeral: (data: { type: 'activity', id: string, active: boolean, activeAt: number, thinking: boolean }) => void
+  ephemeral: (data:
+    | { type: 'activity', id: string, active: boolean, activeAt: number, thinking: boolean }
+    | { type: 'pending-queue', id: string, count: number }
+  ) => void
   auth: (data: { success: boolean, user: string }) => void
   error: (data: { message: string }) => void
 }
