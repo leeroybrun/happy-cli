@@ -267,7 +267,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
 
     // Print log file path
     const logPath = logger.logFilePath;
-    logger.infoDeveloper(`Session: ${response.id}`);
+    logger.infoDeveloper(`Session: ${baseSession.id}`);
     logger.infoDeveloper(`Logs: ${logPath}`);
 
     // Set initial agent state
