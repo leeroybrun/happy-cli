@@ -311,35 +311,37 @@ export const MessageContentSchema = z.union([UserMessageSchema, AgentMessageSche
 
 export type MessageContent = z.infer<typeof MessageContentSchema>
 
-export type Metadata = {
-  path: string,
-  host: string,
-  version?: string,
-  name?: string,
-  os?: string,
-  summary?: {
-    text: string,
-    updatedAt: number
-  },
-  machineId?: string,
-  claudeSessionId?: string, // Claude Code session ID
-  codexSessionId?: string, // Codex session/conversation ID (uuid)
-  tools?: string[],
-  slashCommands?: string[],
-  homeDir: string,
-  happyHomeDir: string,
-  happyLibDir: string,
-  happyToolsDir: string,
-  startedFromDaemon?: boolean,
-  hostPid?: number,
-  startedBy?: 'daemon' | 'terminal',
+export const MetadataSchema = z.object({
+  path: z.string(),
+  host: z.string(),
+  version: z.string().optional(),
+  name: z.string().optional(),
+  os: z.string().optional(),
+  summary: z.object({
+    text: z.string(),
+    updatedAt: z.number(),
+  }).optional(),
+  machineId: z.string().optional(),
+  claudeSessionId: z.string().optional(), // Claude Code session ID
+  codexSessionId: z.string().optional(), // Codex session/conversation ID (uuid)
+  tools: z.array(z.string()).optional(),
+  slashCommands: z.array(z.string()).optional(),
+  homeDir: z.string(),
+  happyHomeDir: z.string(),
+  happyLibDir: z.string(),
+  happyToolsDir: z.string(),
+  startedFromDaemon: z.boolean().optional(),
+  hostPid: z.number().int().positive().optional(),
+  startedBy: z.enum(['daemon', 'terminal']).optional(),
   // Lifecycle state management
-  lifecycleState?: 'running' | 'archiveRequested' | 'archived' | string,
-  lifecycleStateSince?: number,
-  archivedBy?: string,
-  archiveReason?: string,
-  flavor?: string
-};
+  lifecycleState: z.string().optional(),
+  lifecycleStateSince: z.number().optional(),
+  archivedBy: z.string().optional(),
+  archiveReason: z.string().optional(),
+  flavor: z.string().optional(),
+}).passthrough();
+
+export type Metadata = z.infer<typeof MetadataSchema>;
 
 export type AgentState = {
   controlledByUser?: boolean | null | undefined
