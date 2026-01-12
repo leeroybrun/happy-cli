@@ -415,6 +415,13 @@ ${chalk.bold('To clean up runaway processes:')} Use ${chalk.cyan('happy doctor c
         unknownArgs.push('--dangerously-skip-permissions')
       } else if (arg === '--started-by') {
         options.startedBy = args[++i] as 'daemon' | 'terminal'
+      } else if (arg === '--js-runtime') {
+        const runtime = args[++i]
+        if (runtime !== 'node' && runtime !== 'bun') {
+          console.error(chalk.red(`Invalid --js-runtime value: ${runtime}. Must be 'node' or 'bun'`))
+          process.exit(1)
+        }
+        options.jsRuntime = runtime
       } else if (arg === '--claude-env') {
         // Parse KEY=VALUE environment variable to pass to Claude
         const envArg = args[++i]
@@ -463,6 +470,7 @@ ${chalk.bold('Examples:')}
   happy                    Start session
   happy --yolo             Start with bypassing permissions
                             happy sugar for --dangerously-skip-permissions
+  happy --js-runtime bun   Use bun instead of node to spawn Claude Code
   happy --claude-env ANTHROPIC_BASE_URL=http://127.0.0.1:3456
                            Use a custom API endpoint (e.g., claude-code-router)
   happy auth login --force Authenticate
@@ -478,9 +486,9 @@ ${chalk.bold.cyan('Claude Code Options (from `claude --help`):')}
 `)
       
       // Run claude --help and display its output
-      // Use execFileSync with the current Node executable for cross-platform compatibility
+      // Use execFileSync directly with claude CLI for runtime-agnostic compatibility
       try {
-        const claudeHelp = execFileSync(process.execPath, [claudeCliPath, '--help'], { encoding: 'utf8' })
+        const claudeHelp = execFileSync(claudeCliPath, ['--help'], { encoding: 'utf8' })
         console.log(claudeHelp)
       } catch (e) {
         console.log(chalk.yellow('Could not retrieve claude help. Make sure claude is installed.'))
