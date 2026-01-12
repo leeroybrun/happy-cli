@@ -15,6 +15,7 @@ import { getEnvironmentInfo } from '@/ui/doctor';
 import { spawnHappyCLI } from '@/utils/spawnHappyCLI';
 import { writeDaemonState, DaemonLocallyPersistedState, readDaemonState, acquireDaemonLock, releaseDaemonLock, readSettings } from '@/persistence';
 import { supportsVendorResume } from '@/utils/agentCapabilities';
+import { readPersistedHappySessionFile } from '@/daemon/persistedHappySession';
 
 import { cleanupDaemonState, isDaemonRunningCurrentlyInstalledHappyVersion, stopDaemon } from './controlClient';
 import { startDaemonControlServer } from './controlServer';
@@ -290,7 +291,6 @@ export async function startDaemon(): Promise<void> {
         } else {
           logger.debug('[DAEMON RUN] No profile environment variables provided by caller; skipping profile env injection');
         }
-
         // Session identity (non-secret) for cross-device display/debugging
         // Empty string means "no profile" and should still be preserved.
         const sessionProfileEnv: Record<string, string> = {};
@@ -352,9 +352,21 @@ export async function startDaemon(): Promise<void> {
           }
         }
 
+        // If resuming an existing Happy session and no resume id was provided, derive it from local persisted session state.
+        let effectiveResume: string | undefined = normalizedResume || undefined;
+        if (!effectiveResume && normalizedExistingSessionId) {
+          const persisted = await readPersistedHappySessionFile(normalizedExistingSessionId);
+          const next =
+            (persisted?.vendorResumeId && typeof persisted.vendorResumeId === 'string' ? persisted.vendorResumeId : undefined)
+            ?? (typeof (persisted?.metadata as any)?.claudeSessionId === 'string' ? (persisted!.metadata as any).claudeSessionId : undefined);
+          if (typeof next === 'string' && next.trim()) {
+            effectiveResume = next.trim();
+          }
+        }
+
         // Fail closed if caller requests inactive-session resume for an unsupported agent.
         // Upstream policy: Claude-only (vendor resume support).
-        if ((normalizedResume || normalizedExistingSessionId) && !supportsVendorResume(options.agent)) {
+        if ((effectiveResume || normalizedExistingSessionId) && !supportsVendorResume(options.agent)) {
           return {
             type: 'error',
             errorMessage: `Resume is not supported for agent '${options.agent}'.`,
@@ -371,7 +383,7 @@ export async function startDaemon(): Promise<void> {
           const cliPath = join(projectPath(), 'dist', 'index.mjs');
           // Determine agent command - support claude, codex, and gemini
           const agent = options.agent === 'gemini' ? 'gemini' : (options.agent === 'codex' ? 'codex' : 'claude');
-          const resumeArg = normalizedResume ? ` --resume ${normalizedResume}` : '';
+          const resumeArg = effectiveResume ? ` --resume ${effectiveResume}` : '';
           const existingSessionArg = normalizedExistingSessionId ? ` --existing-session ${normalizedExistingSessionId}` : '';
           const fullCommand = `node --no-warnings --no-deprecation ${cliPath} ${agent} --happy-starting-mode remote --started-by daemon${resumeArg}${existingSessionArg}`;
 
@@ -505,8 +517,9 @@ export async function startDaemon(): Promise<void> {
             '--started-by', 'daemon'
           ];
 
-          if (normalizedResume) {
-            args.push('--resume', normalizedResume);
+          // Vendor resume support (upstream: Claude only; forks may extend).
+          if (effectiveResume) {
+            args.push('--resume', effectiveResume);
           }
 
           // Existing session ID for reconnecting to an inactive session.
