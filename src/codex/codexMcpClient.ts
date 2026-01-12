@@ -239,6 +239,7 @@ function isExecpolicyAmendmentDecision(
 /**
  * Get the correct MCP subcommand based on installed codex version
  * Versions >= 0.43.0-alpha.5 use 'mcp-server', older versions use 'mcp'
+ * Returns null if codex is not installed or version cannot be determined
  */
 function getCodexMcpCommand(): string {
     const info = getCodexVersionInfo();
@@ -313,6 +314,17 @@ export class CodexMcpClient {
 
         const versionInfo = getCodexVersionInfo();
         logger.debug('[CodexMCP] Detected codex version', versionInfo);
+        if (!versionInfo.raw) {
+            throw new Error(
+                'Codex CLI not found or not executable.\n' +
+                '\n' +
+                'To install codex:\n' +
+                '  npm install -g @openai/codex\n' +
+                '\n' +
+                'Alternatively, use Claude:\n' +
+                '  happy claude'
+            );
+        }
         // Ensure CODEX_HOME is stable so rollouts are discoverable when resuming,
         // but respect an already-configured CODEX_HOME (e.g. stack-scoped env).
         if (!process.env.CODEX_HOME) {
