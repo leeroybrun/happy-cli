@@ -28,6 +28,8 @@ import { handleConnectCommand } from './commands/connect'
 import { spawnHappyCLI } from './utils/spawnHappyCLI'
 import { claudeCliPath } from './claude/claudeLocal'
 import { execFileSync } from 'node:child_process'
+import { readPersistedHappySessionFile } from './daemon/persistedHappySession'
+import { supportsVendorResume, type AgentType } from './utils/agentCapabilities'
 
 
 (async () => {
@@ -81,6 +83,49 @@ import { execFileSync } from 'node:child_process'
       process.exit(1)
     }
     return;
+  } else if (subcommand === 'resume') {
+    const happySessionId = args[1]
+    if (!happySessionId) {
+      console.error(chalk.red('Error:'), 'Happy session ID required')
+      console.error(`Usage: happy resume <happySessionId>`)
+      process.exit(1)
+    }
+
+    const persisted = await readPersistedHappySessionFile(happySessionId)
+    if (!persisted) {
+      console.error(chalk.red('Error:'), `No local persisted session state found for ${happySessionId}`)
+      console.error(`Tip: this feature requires the session to have been started by a CLI that writes session state under $HAPPY_HOME_DIR/sessions/`)
+      process.exit(1)
+    }
+
+    const flavor = (persisted.metadata as any)?.flavor as AgentType | undefined
+    const agent: AgentType = flavor ?? 'claude'
+    if (!supportsVendorResume(agent)) {
+      console.error(chalk.red('Error:'), `Resume is not supported for agent '${agent}'`)
+      process.exit(1)
+    }
+
+    const vendorResumeId = persisted.vendorResumeId ?? (persisted.metadata as any)?.claudeSessionId
+    if (!vendorResumeId || typeof vendorResumeId !== 'string') {
+      console.error(chalk.red('Error:'), `Missing vendor resume id for ${happySessionId} (Claude session id)`)
+      console.error(`Tip: start the session once so it discovers the Claude session id, then try again.`)
+      process.exit(1)
+    }
+
+    const cwd = typeof (persisted.metadata as any)?.path === 'string' ? (persisted.metadata as any).path : process.cwd()
+    const spawnArgs = [
+      'claude',
+      '--happy-starting-mode', 'remote',
+      '--started-by', 'terminal',
+      '--existing-session', happySessionId,
+      '--resume', vendorResumeId,
+    ]
+
+    const child = spawnHappyCLI(spawnArgs, { cwd, detached: true, stdio: 'ignore', env: process.env })
+    child.unref()
+
+    console.log(`Resuming session ${happySessionId} (pid ${child.pid ?? 'unknown'})`)
+    process.exit(0)
   } else if (subcommand === 'codex') {
     // Handle codex command
     try {
@@ -451,6 +496,7 @@ ${chalk.bold('happy')} - Claude Code On the Go
 
 ${chalk.bold('Usage:')}
   happy [options]         Start Claude with mobile control
+  happy resume            Resume an inactive Happy session (Claude-only)
   happy auth              Manage authentication
   happy codex             Start Codex mode
   happy gemini            Start Gemini mode (ACP)

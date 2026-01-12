@@ -3,6 +3,7 @@ import { MessageQueue2 } from "@/utils/MessageQueue2";
 import { EnhancedMode } from "./loop";
 import { logger } from "@/ui/logger";
 import type { JsRuntime } from "./runClaude";
+import { updatePersistedHappySessionVendorResumeId } from "@/daemon/persistedHappySession";
 
 export class Session {
     readonly path: string;
@@ -108,6 +109,10 @@ export class Session {
             claudeSessionId: sessionId
         }));
         logger.debug(`[Session] Claude Code session ID ${sessionId} added to metadata`);
+
+        // Best-effort: persist vendor resume id locally so `happy resume <happySessionId>` can work
+        // even if the agent process was stopped.
+        void updatePersistedHappySessionVendorResumeId(this.client.sessionId, sessionId).catch(() => {});
         
         // Notify all registered callbacks
         for (const callback of this.sessionFoundCallbacks) {
