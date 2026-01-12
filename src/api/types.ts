@@ -227,7 +227,7 @@ export type Machine = {
   id: string,
   encryptionKey: Uint8Array;
   encryptionVariant: 'legacy' | 'dataKey';
-  metadata: MachineMetadata,
+  metadata: MachineMetadata | null,
   metadataVersion: number,
   daemonState: DaemonState | null,
   daemonStateVersion: number,

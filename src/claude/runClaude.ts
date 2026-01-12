@@ -128,19 +128,26 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             }
         });
 
+        const abortController = new AbortController();
+        const abortOnSignal = () => abortController.abort();
+        process.once('SIGINT', abortOnSignal);
+        process.once('SIGTERM', abortOnSignal);
+
         try {
             await claudeLocal({
                 path: workingDirectory,
                 sessionId: null,
                 onSessionFound: (id) => { offlineSessionId = id; },
                 onThinkingChange: () => {},
-                abort: new AbortController().signal,
+                abort: abortController.signal,
                 claudeEnvVars: options.claudeEnvVars,
                 claudeArgs: options.claudeArgs,
                 mcpServers: {},
                 allowedTools: []
             });
         } finally {
+            process.removeListener('SIGINT', abortOnSignal);
+            process.removeListener('SIGTERM', abortOnSignal);
             reconnection.cancel();
             stopCaffeinate();
         }
