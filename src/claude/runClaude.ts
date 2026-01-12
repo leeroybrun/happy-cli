@@ -24,6 +24,7 @@ import { registerKillSessionHandler } from './registerKillSessionHandler';
 import { projectPath } from '../projectPath';
 import { resolve } from 'node:path';
 import { Session } from './session';
+import { readPersistedHappySession, removeSessionMarker, writePersistedHappySession, writeSessionMarker } from '@/daemon/sessionRegistry';
 
 /** JavaScript runtime to use for spawning Claude Code */
 export type JsRuntime = 'node' | 'bun'
@@ -98,28 +99,78 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         lifecycleStateSince: Date.now(),
         flavor: 'claude'
     };
-    const response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
-    logger.debug(`Session created: ${response.id}`);
+    const argv = process.argv.slice(2);
+    const happySessionArgIdx = argv.findIndex((v) => v === '--happy-session');
+    const happySessionId = happySessionArgIdx >= 0 ? argv[happySessionArgIdx + 1] : null;
+    const resumeIdx = argv.findIndex((v) => v === '--resume');
+    const vendorResume = resumeIdx >= 0 ? argv[resumeIdx + 1] : null;
+
+    const attached = happySessionId ? await readPersistedHappySession(happySessionId) : null;
+    if (happySessionId && !attached) {
+        throw new Error(`Cannot attach to session ${happySessionId}: no local persisted session state found`);
+    }
+
+    const baseSession = attached
+        ? {
+            id: attached.sessionId,
+            seq: 0,
+            metadata: attached.metadata,
+            metadataVersion: attached.metadataVersion,
+            agentState: attached.agentState,
+            agentStateVersion: attached.agentStateVersion,
+            encryptionKey: new Uint8Array(Buffer.from(attached.encryptionKeyBase64, 'base64')),
+            encryptionVariant: attached.encryptionVariant,
+        }
+        : await api.getOrCreateSession({ tag: sessionTag, metadata, state });
+
+    logger.debug(attached ? `Session attached: ${baseSession.id}` : `Session created: ${baseSession.id}`);
+
+    // Create realtime session client as early as possible so background tasks can use it.
+    const session = api.sessionSyncClient(baseSession);
 
     // Always report to daemon if it exists
     try {
-        logger.debug(`[START] Reporting session ${response.id} to daemon`);
-        const result = await notifyDaemonSessionStarted(response.id, metadata);
+        logger.debug(`[START] Reporting session ${baseSession.id} to daemon`);
+        const result = await notifyDaemonSessionStarted(baseSession.id, metadata);
         if (result.error) {
             logger.debug(`[START] Failed to report to daemon (may not be running):`, result.error);
         } else {
-            logger.debug(`[START] Reported session ${response.id} to daemon`);
+            logger.debug(`[START] Reported session ${baseSession.id} to daemon`);
         }
     } catch (error) {
         logger.debug('[START] Failed to report to daemon (may not be running):', error);
     }
+
+    await writePersistedHappySession(
+        {
+            id: baseSession.id,
+            metadata: baseSession.metadata,
+            metadataVersion: baseSession.metadataVersion,
+            agentState: baseSession.agentState,
+            agentStateVersion: baseSession.agentStateVersion,
+            encryptionKey: baseSession.encryptionKey,
+            encryptionVariant: baseSession.encryptionVariant,
+        },
+        { flavor: 'claude', vendorResume }
+    );
+    await writeSessionMarker({
+        pid: process.pid,
+        happySessionId: baseSession.id,
+        flavor: 'claude',
+        startedBy: options.startedBy || 'terminal',
+        cwd: process.cwd(),
+        metadata,
+    });
+    process.once('exit', () => {
+        void removeSessionMarker(process.pid);
+    });
 
     // Extract SDK metadata in background and update session when ready
     extractSDKMetadataAsync(async (sdkMetadata) => {
         logger.debug('[start] SDK metadata extracted, updating session:', sdkMetadata);
         try {
             // Update session metadata with tools and slash commands
-            api.sessionSyncClient(response).updateMetadata((currentMetadata) => ({
+            session.updateMetadata((currentMetadata) => ({
                 ...currentMetadata,
                 tools: sdkMetadata.tools,
                 slashCommands: sdkMetadata.slashCommands
@@ -130,8 +181,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         }
     });
 
-    // Create realtime session
-    const session = api.sessionSyncClient(response);
+    // (session already created above)
 
     // Start Happy MCP server
     const happyServer = await startHappyServer(session);

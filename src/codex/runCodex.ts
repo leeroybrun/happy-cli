@@ -28,6 +28,7 @@ import { notifyDaemonSessionStarted } from "@/daemon/controlClient";
 import { registerKillSessionHandler } from "@/claude/registerKillSessionHandler";
 import { delay } from "@/utils/time";
 import { stopCaffeinate } from "@/utils/caffeinate";
+import { readPersistedHappySession, removeSessionMarker, writePersistedHappySession, writeSessionMarker } from '@/daemon/sessionRegistry';
 
 type ReadyEventOptions = {
     pending: unknown;
@@ -74,7 +75,6 @@ export async function runCodex(opts: {
     // Define session
     //
 
-    const sessionTag = randomUUID();
     const api = await ApiClient.create(opts.credentials);
 
     // Log startup options
@@ -121,21 +121,72 @@ export async function runCodex(opts: {
         lifecycleStateSince: Date.now(),
         flavor: 'codex'
     };
-    const response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
-    const session = api.sessionSyncClient(response);
+
+    const argv = process.argv.slice(2);
+    const happySessionArgIdx = argv.findIndex((v) => v === '--happy-session');
+    const happySessionId = happySessionArgIdx >= 0 ? argv[happySessionArgIdx + 1] : null;
+    const resumeIdx = argv.findIndex((v) => v === '--resume');
+    const vendorResume = resumeIdx >= 0 ? argv[resumeIdx + 1] : null;
+
+    const sessionTag = randomUUID();
+    const attached = happySessionId ? await readPersistedHappySession(happySessionId) : null;
+    if (happySessionId && !attached) {
+        throw new Error(`Cannot attach to session ${happySessionId}: no local persisted session state found`);
+    }
+
+    const baseSession = attached
+        ? {
+            id: attached.sessionId,
+            seq: 0,
+            metadata: attached.metadata,
+            metadataVersion: attached.metadataVersion,
+            agentState: attached.agentState,
+            agentStateVersion: attached.agentStateVersion,
+            encryptionKey: new Uint8Array(Buffer.from(attached.encryptionKeyBase64, 'base64')),
+            encryptionVariant: attached.encryptionVariant,
+        }
+        : await api.getOrCreateSession({ tag: sessionTag, metadata, state });
+
+    const session = api.sessionSyncClient(baseSession);
 
     // Always report to daemon if it exists
     try {
-        logger.debug(`[START] Reporting session ${response.id} to daemon`);
-        const result = await notifyDaemonSessionStarted(response.id, metadata);
+        const reportedSessionId = baseSession.id;
+        logger.debug(`[START] Reporting session ${reportedSessionId} to daemon`);
+        const result = await notifyDaemonSessionStarted(reportedSessionId, metadata);
         if (result.error) {
             logger.debug(`[START] Failed to report to daemon (may not be running):`, result.error);
         } else {
-            logger.debug(`[START] Reported session ${response.id} to daemon`);
+            logger.debug(`[START] Reported session ${reportedSessionId} to daemon`);
         }
     } catch (error) {
         logger.debug('[START] Failed to report to daemon (may not be running):', error);
     }
+
+    const thisSessionId = baseSession.id;
+    await writePersistedHappySession(
+        {
+            id: thisSessionId,
+            metadata: baseSession.metadata,
+            metadataVersion: baseSession.metadataVersion,
+            agentState: baseSession.agentState,
+            agentStateVersion: baseSession.agentStateVersion,
+            encryptionKey: baseSession.encryptionKey,
+            encryptionVariant: baseSession.encryptionVariant,
+        },
+        { flavor: 'codex', vendorResume }
+    );
+    await writeSessionMarker({
+        pid: process.pid,
+        happySessionId: thisSessionId,
+        flavor: 'codex',
+        startedBy: opts.startedBy || 'terminal',
+        cwd: process.cwd(),
+        metadata,
+    });
+    process.once('exit', () => {
+        void removeSessionMarker(process.pid);
+    });
 
     const messageQueue = new MessageQueue2<EnhancedMode>((mode) => hashObject({
         permissionMode: mode.permissionMode,

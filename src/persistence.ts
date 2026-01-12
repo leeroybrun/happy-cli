@@ -6,7 +6,7 @@
 
 import { FileHandle } from 'node:fs/promises'
 import { readFile, writeFile, mkdir, open, unlink, rename, stat } from 'node:fs/promises'
-import { existsSync, writeFileSync, readFileSync, unlinkSync } from 'node:fs'
+import { existsSync, writeFileSync, readFileSync, unlinkSync, renameSync } from 'node:fs'
 import { constants } from 'node:fs'
 import { configuration } from '@/configuration'
 import * as z from 'zod';
@@ -220,24 +220,33 @@ export async function clearMachineId(): Promise<void> {
  * Read daemon state from local file
  */
 export async function readDaemonState(): Promise<DaemonLocallyPersistedState | null> {
-  try {
-    if (!existsSync(configuration.daemonStateFile)) {
-      return null;
-    }
-    const content = await readFile(configuration.daemonStateFile, 'utf-8');
-    return JSON.parse(content) as DaemonLocallyPersistedState;
-  } catch (error) {
-    // State corrupted somehow :(
-    console.error(`[PERSISTENCE] Daemon state file corrupted: ${configuration.daemonStateFile}`, error);
+  if (!existsSync(configuration.daemonStateFile)) {
     return null;
   }
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      // Note: daemon state is written atomically via rename; retry helps if the reader races with filesystem.
+      const content = await readFile(configuration.daemonStateFile, 'utf-8');
+      return JSON.parse(content) as DaemonLocallyPersistedState;
+    } catch (error) {
+      if (attempt === 3) {
+        console.error(`[PERSISTENCE] Daemon state file corrupted: ${configuration.daemonStateFile}`, error);
+        return null;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 15));
+    }
+  }
+  return null;
 }
 
 /**
  * Write daemon state to local file (synchronously for atomic operation)
  */
 export function writeDaemonState(state: DaemonLocallyPersistedState): void {
-  writeFileSync(configuration.daemonStateFile, JSON.stringify(state, null, 2), 'utf-8');
+  const tmpPath = `${configuration.daemonStateFile}.tmp`;
+  writeFileSync(tmpPath, JSON.stringify(state, null, 2), 'utf-8');
+  renameSync(tmpPath, configuration.daemonStateFile);
 }
 
 /**
@@ -246,6 +255,10 @@ export function writeDaemonState(state: DaemonLocallyPersistedState): void {
 export async function clearDaemonState(): Promise<void> {
   if (existsSync(configuration.daemonStateFile)) {
     await unlink(configuration.daemonStateFile);
+  }
+  const tmpPath = `${configuration.daemonStateFile}.tmp`;
+  if (existsSync(tmpPath)) {
+    await unlink(tmpPath).catch(() => {});
   }
   // Also clean up lock file if it exists (for stale cleanup)
   if (existsSync(configuration.daemonLockFile)) {

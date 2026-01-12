@@ -15,12 +15,14 @@ export function startDaemonControlServer({
   getChildren,
   stopSession,
   spawnSession,
+  resumeSession,
   requestShutdown,
   onHappySessionWebhook
 }: {
   getChildren: () => TrackedSession[];
   stopSession: (sessionId: string) => boolean;
   spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
+  resumeSession: (sessionId: string) => Promise<SpawnSessionResult>;
   requestShutdown: () => void;
   onHappySessionWebhook: (sessionId: string, metadata: Metadata) => void;
 }): Promise<{ port: number; stop: () => Promise<void> }> {
@@ -166,6 +168,33 @@ export function startDaemonControlServer({
             error: result.errorMessage
           };
       }
+    });
+
+    // Resume a specific Happy session by its sessionId (uses local persisted session state).
+    typed.post('/resume-session', {
+      schema: {
+        body: z.object({
+          sessionId: z.string()
+        }),
+        response: {
+          200: z.object({
+            success: z.boolean(),
+            sessionId: z.string().optional(),
+            error: z.string().optional(),
+          })
+        }
+      }
+    }, async (request) => {
+      const { sessionId } = request.body;
+      logger.debug(`[CONTROL SERVER] Resume session request: ${sessionId}`);
+      const result = await resumeSession(sessionId);
+      if (result.type === 'success') {
+        return { success: true, sessionId: result.sessionId };
+      }
+      if (result.type === 'requestToApproveDirectoryCreation') {
+        return { success: false, error: `Cannot resume session; directory missing: ${result.directory}` };
+      }
+      return { success: false, error: result.errorMessage };
     });
 
     // Stop daemon

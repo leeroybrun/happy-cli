@@ -15,7 +15,7 @@ import { authAndSetupMachineIfNeeded } from './ui/auth'
 import packageJson from '../package.json'
 import { z } from 'zod'
 import { startDaemon } from './daemon/run'
-import { checkIfDaemonRunningAndCleanupStaleState, isDaemonRunningCurrentlyInstalledHappyVersion, stopDaemon } from './daemon/controlClient'
+import { checkIfDaemonRunningAndCleanupStaleState, isDaemonRunningCurrentlyInstalledHappyVersion, resumeDaemonSession, stopDaemon } from './daemon/controlClient'
 import { getLatestDaemonLog } from './ui/logger'
 import { killRunawayHappyProcesses } from './daemon/doctor'
 import { install } from './daemon/install'
@@ -297,6 +297,32 @@ import { execFileSync } from 'node:child_process'
       }
       return
 
+    } else if (daemonSubcommand === 'resume') {
+      const sessionIds = args.slice(2).filter(Boolean);
+      if (sessionIds.length === 0) {
+        console.error('At least one session ID required');
+        process.exit(1);
+      }
+
+      let ok = 0;
+      for (const sessionId of sessionIds) {
+        try {
+          const result = await resumeDaemonSession(sessionId);
+          if (result?.success) {
+            ok++;
+            console.log(`Resumed: ${sessionId}`);
+          } else {
+            console.log(`Failed: ${sessionId}${result?.error ? ` (${result.error})` : ''}`);
+          }
+        } catch (error) {
+          console.log(`Failed: ${sessionId} (${error instanceof Error ? error.message : 'Unknown error'})`);
+        }
+      }
+      if (ok !== sessionIds.length) {
+        process.exit(1);
+      }
+      return
+
     } else if (daemonSubcommand === 'start') {
       // Spawn detached daemon process
       const child = spawnHappyCLI(['daemon', 'start-sync'], {
@@ -365,6 +391,7 @@ ${chalk.bold('Usage:')}
   happy daemon stop               Stop the daemon (sessions stay alive)
   happy daemon status             Show daemon status
   happy daemon list               List active sessions
+  happy daemon resume <id...>     Resume sessions by Happy sessionId (reattach/restart worker)
 
   If you want to kill all happy related processes run 
   ${chalk.cyan('happy doctor clean')}

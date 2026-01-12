@@ -84,6 +84,11 @@ export async function spawnDaemonSession(directory: string, sessionId?: string):
   return result;
 }
 
+export async function resumeDaemonSession(sessionId: string): Promise<any> {
+  const result = await daemonPost('/resume-session', { sessionId });
+  return result;
+}
+
 export async function stopDaemonHttp(): Promise<void> {
   await daemonPost('/stop');
 }

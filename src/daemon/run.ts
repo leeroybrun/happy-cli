@@ -17,6 +17,7 @@ import { writeDaemonState, DaemonLocallyPersistedState, readDaemonState, acquire
 
 import { cleanupDaemonState, isDaemonRunningCurrentlyInstalledHappyVersion, stopDaemon } from './controlClient';
 import { startDaemonControlServer } from './controlServer';
+import { listSessionMarkers, readPersistedHappySession, removeSessionMarker, writeSessionMarker } from './sessionRegistry';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { projectPath } from '@/projectPath';
@@ -140,9 +141,44 @@ export async function startDaemon(): Promise<void> {
     // Helper functions
     const getCurrentChildren = () => Array.from(pidToTrackedSession.values());
 
+    // On daemon restart, reattach to still-running sessions via disk markers (stack-scoped by HAPPY_HOME_DIR).
+    try {
+      const markers = await listSessionMarkers();
+      let adopted = 0;
+      for (const marker of markers) {
+        // Safety: never attach cross-stack.
+        if (marker.happyHomeDir !== configuration.happyHomeDir) continue;
+        try {
+          process.kill(marker.pid, 0);
+        } catch {
+          await removeSessionMarker(marker.pid);
+          continue;
+        }
+        if (pidToTrackedSession.has(marker.pid)) continue;
+        pidToTrackedSession.set(marker.pid, {
+          startedBy: marker.startedBy ?? 'reattached',
+          happySessionId: marker.happySessionId,
+          happySessionMetadataFromLocalWebhook: marker.metadata,
+          pid: marker.pid,
+        });
+        adopted++;
+      }
+      if (adopted > 0) {
+        logger.debug(`[DAEMON RUN] Reattached ${adopted} sessions from disk markers`);
+      }
+    } catch (e) {
+      logger.debug('[DAEMON RUN] Failed to reattach sessions from disk markers', e);
+    }
+
     // Handle webhook from happy session reporting itself
     const onHappySessionWebhook = (sessionId: string, sessionMetadata: Metadata) => {
       logger.debugLargeJson(`[DAEMON RUN] Session reported`, sessionMetadata);
+
+      // Safety: ignore cross-daemon/cross-stack reports.
+      if (sessionMetadata?.happyHomeDir && sessionMetadata.happyHomeDir !== configuration.happyHomeDir) {
+        logger.debug(`[DAEMON RUN] Ignoring session report for different happyHomeDir: ${sessionMetadata.happyHomeDir}`);
+        return;
+      }
 
       const pid = sessionMetadata.hostPid;
       if (!pid) {
@@ -180,6 +216,15 @@ export async function startDaemon(): Promise<void> {
         pidToTrackedSession.set(pid, trackedSession);
         logger.debug(`[DAEMON RUN] Registered externally-started session ${sessionId}`);
       }
+
+      // Best-effort: write/update marker so future daemon restarts can reattach.
+      void writeSessionMarker({
+        pid,
+        happySessionId: sessionId,
+        startedBy: sessionMetadata.startedBy ?? 'terminal',
+        cwd: sessionMetadata.path,
+        metadata: sessionMetadata,
+      }).catch(() => { });
     };
 
     // Spawn a new session (sessionId reserved for future --resume functionality)
@@ -413,6 +458,86 @@ export async function startDaemon(): Promise<void> {
     const onChildExited = (pid: number) => {
       logger.debug(`[DAEMON RUN] Removing exited process PID ${pid} from tracking`);
       pidToTrackedSession.delete(pid);
+      void removeSessionMarker(pid).catch(() => { });
+    };
+
+    const resumeSession = async (sessionId: string): Promise<SpawnSessionResult> => {
+      // If already tracked and alive, no-op.
+      for (const [pid, s] of pidToTrackedSession.entries()) {
+        if (s.happySessionId === sessionId) {
+          try {
+            process.kill(pid, 0);
+            return { type: 'success', sessionId };
+          } catch {
+            // stale; remove and continue
+            pidToTrackedSession.delete(pid);
+            void removeSessionMarker(pid).catch(() => { });
+            break;
+          }
+        }
+      }
+
+      const persisted = await readPersistedHappySession(sessionId);
+      if (!persisted) {
+        return { type: 'error', errorMessage: `No local persisted session state found for ${sessionId}` };
+      }
+
+      // Safety: ensure this session belongs to this stack home dir.
+      if (persisted.metadata?.happyHomeDir && persisted.metadata.happyHomeDir !== configuration.happyHomeDir) {
+        return { type: 'error', errorMessage: `Refusing to resume session from different happyHomeDir: ${persisted.metadata.happyHomeDir}` };
+      }
+
+      const agentCommand = persisted.flavor;
+      const cwd = typeof persisted.metadata?.path === 'string' ? persisted.metadata.path : process.cwd();
+      const args: string[] = [
+        agentCommand,
+        '--happy-starting-mode', 'remote',
+        '--started-by', 'daemon',
+        '--happy-session', persisted.sessionId,
+      ];
+      if (persisted.vendorResume) {
+        args.push('--resume', persisted.vendorResume);
+      }
+
+      logger.debug(`[DAEMON RUN] Resuming session ${persisted.sessionId} with args: ${JSON.stringify(args)} cwd=${cwd}`);
+      const happyProcess = spawnHappyCLI(args, {
+        cwd,
+        detached: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env },
+      });
+      if (!happyProcess.pid) {
+        return { type: 'error', errorMessage: 'Failed to spawn Happy process - no PID returned' };
+      }
+
+      const trackedSession: TrackedSession = {
+        startedBy: 'daemon',
+        pid: happyProcess.pid,
+        childProcess: happyProcess,
+        happySessionId: persisted.sessionId,
+        happySessionMetadataFromLocalWebhook: persisted.metadata,
+      };
+      pidToTrackedSession.set(happyProcess.pid, trackedSession);
+
+      happyProcess.on('exit', (code, signal) => {
+        logger.debug(`[DAEMON RUN] Child PID ${happyProcess.pid} exited with code ${code}, signal ${signal}`);
+        if (happyProcess.pid) onChildExited(happyProcess.pid);
+      });
+      happyProcess.on('error', () => {
+        if (happyProcess.pid) onChildExited(happyProcess.pid);
+      });
+
+      // Write marker immediately so we can reattach even if the process never calls /session-started (older versions).
+      void writeSessionMarker({
+        pid: happyProcess.pid,
+        happySessionId: persisted.sessionId,
+        flavor: persisted.flavor,
+        startedBy: 'daemon',
+        cwd,
+        metadata: persisted.metadata,
+      }).catch(() => { });
+
+      return { type: 'success', sessionId: persisted.sessionId };
     };
 
     // Start control server
@@ -420,6 +545,7 @@ export async function startDaemon(): Promise<void> {
       getChildren: getCurrentChildren,
       stopSession,
       spawnSession,
+      resumeSession,
       requestShutdown: () => requestShutdown('happy-cli'),
       onHappySessionWebhook
     });
