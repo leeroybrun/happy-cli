@@ -55,3 +55,4 @@ export class CodexPermissionHandler extends BasePermissionHandler {
             logger.debug(`${this.getLogPrefix()} Permission request sent for tool: ${toolName} (${toolCallId})`);
         });
     }
+}
