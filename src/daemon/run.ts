@@ -17,6 +17,7 @@ import { writeDaemonState, DaemonLocallyPersistedState, readDaemonState, acquire
 
 import { cleanupDaemonState, isDaemonRunningCurrentlyInstalledHappyVersion, stopDaemon } from './controlClient';
 import { startDaemonControlServer } from './controlServer';
+import { listSessionMarkers, removeSessionMarker, writeSessionMarker } from './sessionRegistry';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { projectPath } from '@/projectPath';
@@ -173,9 +174,44 @@ export async function startDaemon(): Promise<void> {
     // Helper functions
     const getCurrentChildren = () => Array.from(pidToTrackedSession.values());
 
+    // On daemon restart, reattach to still-running sessions via disk markers (stack-scoped by HAPPY_HOME_DIR).
+    try {
+      const markers = await listSessionMarkers();
+      let adopted = 0;
+      for (const marker of markers) {
+        // Safety: never attach cross-stack.
+        if (marker.happyHomeDir !== configuration.happyHomeDir) continue;
+        try {
+          process.kill(marker.pid, 0);
+        } catch {
+          await removeSessionMarker(marker.pid);
+          continue;
+        }
+        if (pidToTrackedSession.has(marker.pid)) continue;
+        pidToTrackedSession.set(marker.pid, {
+          startedBy: marker.startedBy ?? 'reattached',
+          happySessionId: marker.happySessionId,
+          happySessionMetadataFromLocalWebhook: marker.metadata,
+          pid: marker.pid,
+        });
+        adopted++;
+      }
+      if (adopted > 0) {
+        logger.debug(`[DAEMON RUN] Reattached ${adopted} sessions from disk markers`);
+      }
+    } catch (e) {
+      logger.debug('[DAEMON RUN] Failed to reattach sessions from disk markers', e);
+    }
+
     // Handle webhook from happy session reporting itself
     const onHappySessionWebhook = (sessionId: string, sessionMetadata: Metadata) => {
       logger.debugLargeJson(`[DAEMON RUN] Session reported`, sessionMetadata);
+
+      // Safety: ignore cross-daemon/cross-stack reports.
+      if (sessionMetadata?.happyHomeDir && sessionMetadata.happyHomeDir !== configuration.happyHomeDir) {
+        logger.debug(`[DAEMON RUN] Ignoring session report for different happyHomeDir: ${sessionMetadata.happyHomeDir}`);
+        return;
+      }
 
       const pid = sessionMetadata.hostPid;
       if (!pid) {
@@ -213,6 +249,15 @@ export async function startDaemon(): Promise<void> {
         pidToTrackedSession.set(pid, trackedSession);
         logger.debug(`[DAEMON RUN] Registered externally-started session ${sessionId}`);
       }
+
+      // Best-effort: write/update marker so future daemon restarts can reattach.
+      void writeSessionMarker({
+        pid,
+        happySessionId: sessionId,
+        startedBy: sessionMetadata.startedBy ?? 'terminal',
+        cwd: sessionMetadata.path,
+        metadata: sessionMetadata,
+      }).catch(() => { });
     };
 
     // Spawn a new session (sessionId reserved for future --resume functionality)
@@ -634,6 +679,7 @@ export async function startDaemon(): Promise<void> {
     const onChildExited = (pid: number) => {
       logger.debug(`[DAEMON RUN] Removing exited process PID ${pid} from tracking`);
       pidToTrackedSession.delete(pid);
+      void removeSessionMarker(pid).catch(() => { });
     };
 
     // Start control server
