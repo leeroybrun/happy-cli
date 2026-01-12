@@ -317,6 +317,7 @@ export type Metadata = {
   },
   machineId?: string,
   claudeSessionId?: string, // Claude Code session ID
+  codexSessionId?: string, // Codex session ID (fork resume)
   tools?: string[],
   slashCommands?: string[],
   homeDir: string,

@@ -107,15 +107,18 @@ import { supportsVendorResume, type AgentType } from './utils/agentCapabilities'
           continue
         }
 
-        const vendorResumeId = persisted.vendorResumeId ?? (persisted.metadata as any)?.claudeSessionId
+        const vendorResumeId =
+          persisted.vendorResumeId
+          ?? (persisted.metadata as any)?.claudeSessionId
+          ?? (persisted.metadata as any)?.codexSessionId
         if (!vendorResumeId || typeof vendorResumeId !== 'string') {
-          console.error(chalk.red('Error:'), `Missing vendor resume id for ${happySessionId} (Claude session id)`)
+          console.error(chalk.red('Error:'), `Missing vendor resume id for ${happySessionId}`)
           continue
         }
 
         const cwd = typeof (persisted.metadata as any)?.path === 'string' ? (persisted.metadata as any).path : process.cwd()
         const spawnArgs = [
-          'claude',
+          agent,
           '--happy-starting-mode', 'remote',
           '--started-by', 'terminal',
           '--existing-session', happySessionId,
@@ -142,16 +145,22 @@ import { supportsVendorResume, type AgentType } from './utils/agentCapabilities'
       
       // Parse startedBy argument
       let startedBy: 'daemon' | 'terminal' | undefined = undefined;
+      let existingSessionId: string | undefined = undefined;
+      let resume: string | undefined = undefined;
       for (let i = 1; i < args.length; i++) {
         if (args[i] === '--started-by') {
           startedBy = args[++i] as 'daemon' | 'terminal';
+        } else if (args[i] === '--existing-session') {
+          existingSessionId = args[++i];
+        } else if (args[i] === '--resume') {
+          resume = args[++i];
         }
       }
       
       const {
         credentials
       } = await authAndSetupMachineIfNeeded();
-      await runCodex({credentials, startedBy});
+      await runCodex({ credentials, startedBy, existingSessionId, resume });
       // Do not force exit here; allow instrumentation to show lingering handles
     } catch (error) {
       console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')

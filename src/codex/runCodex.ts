@@ -17,7 +17,6 @@ import { hashObject } from '@/utils/deterministicJson';
 import { projectPath } from '@/projectPath';
 import { resolve, join } from 'node:path';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
-import fs from 'node:fs';
 import { startHappyServer } from '@/claude/utils/startHappyServer';
 import { MessageBuffer } from "@/ui/ink/messageBuffer";
 import { CodexDisplay } from "@/ui/ink/CodexDisplay";
@@ -31,6 +30,7 @@ import { stopCaffeinate } from "@/utils/caffeinate";
 import { connectionState } from '@/utils/serverConnectionErrors';
 import { setupOfflineReconnection } from '@/utils/setupOfflineReconnection';
 import type { ApiSessionClient } from '@/api/apiSession';
+import { readPersistedHappySession, writePersistedHappySession, updatePersistedHappySessionVendorResumeId } from "@/daemon/persistedHappySession";
 
 type ReadyEventOptions = {
     pending: unknown;
@@ -66,6 +66,8 @@ export function emitReadyIfIdle({ pending, queueSize, shouldExit, sendReady, not
 export async function runCodex(opts: {
     credentials: Credentials;
     startedBy?: 'daemon' | 'terminal';
+    existingSessionId?: string;
+    resume?: string;
 }): Promise<void> {
     // Use shared PermissionMode type for cross-agent compatibility
     type PermissionMode = import('@/api/types').PermissionMode;
@@ -105,7 +107,7 @@ export async function runCodex(opts: {
     });
 
     //
-    // Create session
+    // Attach to existing Happy session (inactive-session-resume) OR create a new one.
     //
 
     const { state, metadata } = createSessionMetadata({
@@ -113,41 +115,83 @@ export async function runCodex(opts: {
         machineId,
         startedBy: opts.startedBy
     });
-    const response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
-
-    // Handle server unreachable case - create offline stub with hot reconnection
     let session: ApiSessionClient;
     // Permission handler declared here so it can be updated in onSessionSwap callback
-    // (assigned later at line ~385 after client setup)
+    // (assigned later after client setup)
     let permissionHandler: CodexPermissionHandler;
-    const { session: initialSession, reconnectionHandle } = setupOfflineReconnection({
-        api,
-        sessionTag,
-        metadata,
-        state,
-        response,
-        onSessionSwap: (newSession) => {
-            session = newSession;
-            // Update permission handler with new session to avoid stale reference
-            if (permissionHandler) {
-                permissionHandler.updateSession(newSession);
-            }
-        }
-    });
-    session = initialSession;
+    // Offline reconnection handle (only relevant when creating a new session and server is unreachable)
+    let reconnectionHandle: { cancel: () => void } | null = null;
 
-    // Always report to daemon if it exists (skip if offline)
-    if (response) {
+    if (typeof opts.existingSessionId === 'string' && opts.existingSessionId.trim()) {
+        const existingId = opts.existingSessionId.trim();
+        logger.debug(`[codex] Attaching to existing Happy session: ${existingId}`);
+        const attached = await readPersistedHappySession(existingId);
+        if (!attached) {
+            throw new Error(`Cannot resume session ${existingId}: no local persisted session state found`);
+        }
+        // Ensure we have a local persisted session file for future resume.
+        await writePersistedHappySession(attached);
+
+        session = api.sessionSyncClient(attached);
+        // Refresh metadata on startup (mark session active and update runtime fields).
+        session.updateMetadata((currentMetadata: any) => ({
+            ...currentMetadata,
+            ...metadata,
+            lifecycleState: 'running',
+            lifecycleStateSince: Date.now(),
+        }));
+
+        // Always report to daemon if it exists
         try {
-            logger.debug(`[START] Reporting session ${response.id} to daemon`);
-            const result = await notifyDaemonSessionStarted(response.id, metadata);
+            logger.debug(`[START] Reporting session ${existingId} to daemon`);
+            const result = await notifyDaemonSessionStarted(existingId, metadata);
             if (result.error) {
                 logger.debug(`[START] Failed to report to daemon (may not be running):`, result.error);
             } else {
-                logger.debug(`[START] Reported session ${response.id} to daemon`);
+                logger.debug(`[START] Reported session ${existingId} to daemon`);
             }
         } catch (error) {
             logger.debug('[START] Failed to report to daemon (may not be running):', error);
+        }
+    } else {
+        const response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
+
+        // Persist session for later resume (only if server responded).
+        if (response) {
+            await writePersistedHappySession(response);
+        }
+
+        // Handle server unreachable case - create offline stub with hot reconnection
+        const offline = setupOfflineReconnection({
+            api,
+            sessionTag,
+            metadata,
+            state,
+            response,
+            onSessionSwap: (newSession) => {
+                session = newSession;
+                // Update permission handler with new session to avoid stale reference
+                if (permissionHandler) {
+                    permissionHandler.updateSession(newSession);
+                }
+            }
+        });
+        session = offline.session;
+        reconnectionHandle = offline.reconnectionHandle;
+
+        // Always report to daemon if it exists (skip if offline)
+        if (response) {
+            try {
+                logger.debug(`[START] Reporting session ${response.id} to daemon`);
+                const result = await notifyDaemonSessionStarted(response.id, metadata);
+                if (result.error) {
+                    logger.debug(`[START] Failed to report to daemon (may not be running):`, result.error);
+                } else {
+                    logger.debug(`[START] Reported session ${response.id} to daemon`);
+                }
+            } catch (error) {
+                logger.debug('[START] Failed to report to daemon (may not be running):', error);
+            }
         }
     }
 
@@ -188,6 +232,18 @@ export async function runCodex(opts: {
         };
         messageQueue.push(message.content.text, enhancedMode);
     });
+
+    // Queue initial message if provided (for inactive session resume)
+    const initialMessage = process.env.HAPPY_INITIAL_MESSAGE;
+    if (initialMessage) {
+        logger.debug(`[codex] Queuing initial message for resumed session: ${initialMessage.substring(0, 50)}...`);
+        const initialEnhancedMode: EnhancedMode = {
+            permissionMode: currentPermissionMode || 'default',
+            model: currentModel,
+        };
+        messageQueue.push(initialMessage, initialEnhancedMode);
+    }
+
     let thinking = false;
     session.keepAlive(thinking, 'remote');
     // Periodic keep-alive; store handle so we can clear on exit
@@ -236,6 +292,10 @@ export async function runCodex(opts: {
     let abortController = new AbortController();
     let shouldExit = false;
     let storedSessionIdForResume: string | null = null;
+    if (typeof opts.resume === 'string' && opts.resume.trim()) {
+        storedSessionIdForResume = opts.resume.trim();
+        logger.debug('[Codex] Resume requested via --resume:', storedSessionIdForResume);
+    }
 
     /**
      * Handles aborting the current task/inference without exiting the process.
@@ -350,47 +410,7 @@ export async function runCodex(opts: {
 
     const client = new CodexMcpClient();
 
-    // Helper: find Codex session transcript for a given sessionId
-    function findCodexResumeFile(sessionId: string | null): string | null {
-        if (!sessionId) return null;
-        try {
-            const codexHomeDir = process.env.CODEX_HOME || join(os.homedir(), '.codex');
-            const rootDir = join(codexHomeDir, 'sessions');
-
-            // Recursively collect all files under the sessions directory
-            function collectFilesRecursive(dir: string, acc: string[] = []): string[] {
-                let entries: fs.Dirent[];
-                try {
-                    entries = fs.readdirSync(dir, { withFileTypes: true });
-                } catch {
-                    return acc;
-                }
-                for (const entry of entries) {
-                    const full = join(dir, entry.name);
-                    if (entry.isDirectory()) {
-                        collectFilesRecursive(full, acc);
-                    } else if (entry.isFile()) {
-                        acc.push(full);
-                    }
-                }
-                return acc;
-            }
-
-            const candidates = collectFilesRecursive(rootDir)
-                .filter(full => full.endsWith(`-${sessionId}.jsonl`))
-                .filter(full => {
-                    try { return fs.statSync(full).isFile(); } catch { return false; }
-                })
-                .sort((a, b) => {
-                    const sa = fs.statSync(a).mtimeMs;
-                    const sb = fs.statSync(b).mtimeMs;
-                    return sb - sa; // newest first
-                });
-            return candidates[0] || null;
-        } catch {
-            return null;
-        }
-    }
+    // NOTE: Fork resume intentionally avoids transcript-based resume (no `.jsonl` scanning).
     permissionHandler = new CodexPermissionHandler(session);
     const reasoningProcessor = new ReasoningProcessor((message) => {
         // Callback to send messages directly from the processor
@@ -403,6 +423,23 @@ export async function runCodex(opts: {
     client.setPermissionHandler(permissionHandler);
     client.setHandler((msg) => {
         logger.debug(`[Codex] MCP message: ${JSON.stringify(msg)}`);
+
+        // Persist Codex session id for later resume (fork-only).
+        const nextId = client.getSessionId();
+        if (typeof nextId === 'string' && nextId) {
+            session.updateMetadata((currentMetadata: any) => {
+                if (currentMetadata.codexSessionId === nextId) {
+                    return currentMetadata;
+                }
+                return {
+                    ...currentMetadata,
+                    codexSessionId: nextId,
+                };
+            });
+            void updatePersistedHappySessionVendorResumeId(session.sessionId, nextId).catch((e) => {
+                logger.debug('[Codex] Failed to persist vendor resume id', e);
+            });
+        }
 
         // Add messages to the ink UI buffer based on message type
         if (msg.type === 'agent_message') {
@@ -562,8 +599,6 @@ export async function runCodex(opts: {
         let wasCreated = false;
         let currentModeHash: string | null = null;
         let pending: { message: string; mode: EnhancedMode; isolate: boolean; hash: string } | null = null;
-        // If we restart (e.g., mode change), use this to carry a resume file
-        let nextExperimentalResume: string | null = null;
 
         while (!shouldExit) {
             logActiveHandles('loop-top');
@@ -596,19 +631,6 @@ export async function runCodex(opts: {
                 logger.debug('[Codex] Mode changed – restarting Codex session');
                 messageBuffer.addMessage('═'.repeat(40), 'status');
                 messageBuffer.addMessage('Starting new Codex session (mode changed)...', 'status');
-                // Capture previous sessionId and try to find its transcript to resume
-                try {
-                    const prevSessionId = client.getSessionId();
-                    nextExperimentalResume = findCodexResumeFile(prevSessionId);
-                    if (nextExperimentalResume) {
-                        logger.debug(`[Codex] Found resume file for session ${prevSessionId}: ${nextExperimentalResume}`);
-                        messageBuffer.addMessage('Resuming previous context…', 'status');
-                    } else {
-                        logger.debug('[Codex] No resume file found for previous session');
-                    }
-                } catch (e) {
-                    logger.debug('[Codex] Error while searching resume file', e);
-                }
                 client.clearSession();
                 wasCreated = false;
                 currentModeHash = null;
@@ -667,38 +689,21 @@ export async function runCodex(opts: {
                     if (message.mode.model) {
                         startConfig.model = message.mode.model;
                     }
-                    
-                    // Check for resume file from multiple sources
-                    let resumeFile: string | null = null;
-                    
-                    // Priority 1: Explicit resume file from mode change
-                    if (nextExperimentalResume) {
-                        resumeFile = nextExperimentalResume;
-                        nextExperimentalResume = null; // consume once
-                        logger.debug('[Codex] Using resume file from mode change:', resumeFile);
-                    }
-                    // Priority 2: Resume from stored abort session
-                    else if (storedSessionIdForResume) {
-                        const abortResumeFile = findCodexResumeFile(storedSessionIdForResume);
-                        if (abortResumeFile) {
-                            resumeFile = abortResumeFile;
-                            logger.debug('[Codex] Using resume file from aborted session:', resumeFile);
-                            messageBuffer.addMessage('Resuming from aborted session...', 'status');
-                        }
+
+                    // Resume-by-session-id path (fork): seed codex-reply with the previous session id.
+                    if (storedSessionIdForResume) {
+                        const resumeId = storedSessionIdForResume;
                         storedSessionIdForResume = null; // consume once
+                        messageBuffer.addMessage('Resuming previous context…', 'status');
+                        client.setSessionIdForResume(resumeId);
+                        await client.continueSession(message.message, { signal: abortController.signal });
+                        wasCreated = true;
+                        first = false;
+                    } else {
+                        await client.startSession(startConfig, { signal: abortController.signal });
+                        wasCreated = true;
+                        first = false;
                     }
-                    
-                    // Apply resume file if found
-                    if (resumeFile) {
-                        (startConfig.config as any).experimental_resume = resumeFile;
-                    }
-                    
-                    await client.startSession(
-                        startConfig,
-                        { signal: abortController.signal }
-                    );
-                    wasCreated = true;
-                    first = false;
                 } else {
                     const response = await client.continueSession(
                         message.message,

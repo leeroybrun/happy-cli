@@ -358,7 +358,8 @@ export async function startDaemon(): Promise<void> {
           const persisted = await readPersistedHappySessionFile(normalizedExistingSessionId);
           const next =
             (persisted?.vendorResumeId && typeof persisted.vendorResumeId === 'string' ? persisted.vendorResumeId : undefined)
-            ?? (typeof (persisted?.metadata as any)?.claudeSessionId === 'string' ? (persisted!.metadata as any).claudeSessionId : undefined);
+            ?? (typeof (persisted?.metadata as any)?.claudeSessionId === 'string' ? (persisted!.metadata as any).claudeSessionId : undefined)
+            ?? (typeof (persisted?.metadata as any)?.codexSessionId === 'string' ? (persisted!.metadata as any).codexSessionId : undefined);
           if (typeof next === 'string' && next.trim()) {
             effectiveResume = next.trim();
           }
