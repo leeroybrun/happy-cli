@@ -1,6 +1,19 @@
 import { z } from 'zod'
 import { UsageSchema } from '@/claude/types'
-import { PermissionMode } from '@/claude/loop'
+
+/**
+ * Permission mode type - includes both Claude and Codex modes
+ * Must match MessageMetaSchema.permissionMode enum values
+ *
+ * Claude modes: default, acceptEdits, bypassPermissions, plan
+ * Codex modes: read-only, safe-yolo, yolo
+ *
+ * When calling Claude SDK, Codex modes are mapped at the SDK boundary:
+ * - yolo → bypassPermissions
+ * - safe-yolo → default
+ * - read-only → default
+ */
+export type PermissionMode = 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan' | 'read-only' | 'safe-yolo' | 'yolo'
 
 /**
  * Usage data type from Claude
@@ -101,6 +114,15 @@ export interface ServerToClientEvents {
  */
 export interface ClientToServerEvents {
   message: (data: { sid: string, message: any }) => void
+  'pending-enqueue': (data: { sid: string, message: string, localId?: string | null }, cb: (response: { ok: boolean, id?: string, error?: string }) => void) => void
+  'pending-list': (data: { sid: string, limit?: number }, cb: (response: {
+    ok: boolean,
+    error?: string,
+    messages?: Array<{ id: string, localId: string | null, message: string, createdAt: number, updatedAt: number }>
+  }) => void) => void
+  'pending-update': (data: { sid: string, id: string, message: string }, cb: (response: { ok: boolean, error?: string }) => void) => void
+  'pending-delete': (data: { sid: string, id: string }, cb: (response: { ok: boolean, error?: string }) => void) => void
+  'pending-pop': (data: { sid: string }, cb: (response: { ok: boolean, popped?: boolean, error?: string }) => void) => void
   'session-alive': (data: {
     sid: string;
     time: number;
@@ -229,7 +251,7 @@ export type SessionMessage = z.infer<typeof SessionMessageSchema>
  */
 export const MessageMetaSchema = z.object({
   sentFrom: z.string().optional(), // Source identifier
-  permissionMode: z.string().optional(), // Permission mode for this message
+  permissionMode: z.enum(['default', 'acceptEdits', 'bypassPermissions', 'plan', 'read-only', 'safe-yolo', 'yolo']).optional(), // Permission mode for this message
   model: z.string().nullable().optional(), // Model name for this message (null = reset)
   fallbackModel: z.string().nullable().optional(), // Fallback model for this message (null = reset)
   customSystemPrompt: z.string().nullable().optional(), // Custom system prompt for this message (null = reset)
@@ -298,6 +320,7 @@ export type Metadata = {
   },
   machineId?: string,
   claudeSessionId?: string, // Claude Code session ID
+  codexSessionId?: string, // Codex session/conversation ID (uuid)
   tools?: string[],
   slashCommands?: string[],
   homeDir: string,
@@ -333,7 +356,7 @@ export type AgentState = {
       status: 'canceled' | 'denied' | 'approved',
       reason?: string,
       mode?: PermissionMode,
-      decision?: 'approved' | 'approved_for_session' | 'denied' | 'abort',
+      decision?: 'approved' | 'approved_for_session' | 'approved_execpolicy_amendment' | 'denied' | 'abort',
       allowTools?: string[]
     }
   }

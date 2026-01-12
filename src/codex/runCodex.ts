@@ -8,7 +8,6 @@ import { DiffProcessor } from './utils/diffProcessor';
 import { randomUUID } from 'node:crypto';
 import { logger } from '@/ui/logger';
 import { Credentials, readSettings } from '@/persistence';
-import { AgentState, Metadata } from '@/api/types';
 import { initialMachineMetadata } from '@/daemon/run';
 import { configuration } from '@/configuration';
 import packageJson from '../../package.json';
@@ -17,18 +16,24 @@ import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
 import { projectPath } from '@/projectPath';
 import { resolve, join } from 'node:path';
+import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import fs from 'node:fs';
 import { startHappyServer } from '@/claude/utils/startHappyServer';
 import { MessageBuffer } from "@/ui/ink/messageBuffer";
 import { CodexDisplay } from "@/ui/ink/CodexDisplay";
 import { trimIdent } from "@/utils/trimIdent";
-import type { CodexSessionConfig } from './types';
+import type { CodexSessionConfig, CodexToolResponse } from './types';
 import { CHANGE_TITLE_INSTRUCTION } from '@/gemini/constants';
 import { notifyDaemonSessionStarted } from "@/daemon/controlClient";
 import { registerKillSessionHandler } from "@/claude/registerKillSessionHandler";
 import { delay } from "@/utils/time";
 import { stopCaffeinate } from "@/utils/caffeinate";
 import { readPersistedHappySession, removeSessionMarker, writePersistedHappySession, writeSessionMarker } from '@/daemon/sessionRegistry';
+import { formatErrorForUi } from "@/utils/formatErrorForUi";
+import { parseSpecialCommand } from '@/parsers/specialCommands';
+import { connectionState } from '@/utils/serverConnectionErrors';
+import { setupOfflineReconnection } from '@/utils/setupOfflineReconnection';
+import type { ApiSessionClient } from '@/api/apiSession';
 
 type ReadyEventOptions = {
     pending: unknown;
@@ -64,8 +69,10 @@ export function emitReadyIfIdle({ pending, queueSize, shouldExit, sendReady, not
 export async function runCodex(opts: {
     credentials: Credentials;
     startedBy?: 'daemon' | 'terminal';
+    resume?: string;
 }): Promise<void> {
-    type PermissionMode = 'default' | 'read-only' | 'safe-yolo' | 'yolo';
+    // Use shared PermissionMode type for cross-agent compatibility
+    type PermissionMode = import('@/api/types').PermissionMode;
     interface EnhancedMode {
         permissionMode: PermissionMode;
         model?: string;
@@ -74,6 +81,11 @@ export async function runCodex(opts: {
     //
     // Define session
     //
+
+    const sessionTag = randomUUID();
+
+    // Set backend for offline warnings (before any API calls)
+    connectionState.setBackend('Codex');
 
     const api = await ApiClient.create(opts.credentials);
 
@@ -100,27 +112,11 @@ export async function runCodex(opts: {
     // Create session
     //
 
-    let state: AgentState = {
-        controlledByUser: false,
-    }
-    let metadata: Metadata = {
-        path: process.cwd(),
-        host: os.hostname(),
-        version: packageJson.version,
-        os: os.platform(),
-        machineId: machineId,
-        homeDir: os.homedir(),
-        happyHomeDir: configuration.happyHomeDir,
-        happyLibDir: projectPath(),
-        happyToolsDir: resolve(projectPath(), 'tools', 'unpacked'),
-        startedFromDaemon: opts.startedBy === 'daemon',
-        hostPid: process.pid,
-        startedBy: opts.startedBy || 'terminal',
-        // Initialize lifecycle state
-        lifecycleState: 'running',
-        lifecycleStateSince: Date.now(),
-        flavor: 'codex'
-    };
+    const { state, metadata } = createSessionMetadata({
+        flavor: 'codex',
+        machineId,
+        startedBy: opts.startedBy
+    });
 
     const argv = process.argv.slice(2);
     const happySessionArgIdx = argv.findIndex((v) => v === '--happy-session');
@@ -128,14 +124,22 @@ export async function runCodex(opts: {
     const resumeIdx = argv.findIndex((v) => v === '--resume');
     const vendorResume = resumeIdx >= 0 ? argv[resumeIdx + 1] : null;
 
-    const sessionTag = randomUUID();
     const attached = happySessionId ? await readPersistedHappySession(happySessionId) : null;
     if (happySessionId && !attached) {
         throw new Error(`Cannot attach to session ${happySessionId}: no local persisted session state found`);
     }
 
-    const baseSession = attached
-        ? {
+    // Permission handler declared here so it can be updated in onSessionSwap callback
+    // (assigned later after client setup)
+    let permissionHandler: CodexPermissionHandler;
+    let reconnectionHandle: { cancel: () => void } | null = null;
+
+    let session: ApiSessionClient;
+    let persistedSession: any = null;
+
+    const response = attached ? null : await api.getOrCreateSession({ tag: sessionTag, metadata, state });
+    if (attached) {
+        persistedSession = {
             id: attached.sessionId,
             seq: 0,
             metadata: attached.metadata,
@@ -144,49 +148,67 @@ export async function runCodex(opts: {
             agentStateVersion: attached.agentStateVersion,
             encryptionKey: new Uint8Array(Buffer.from(attached.encryptionKeyBase64, 'base64')),
             encryptionVariant: attached.encryptionVariant,
-        }
-        : await api.getOrCreateSession({ tag: sessionTag, metadata, state });
-
-    const session = api.sessionSyncClient(baseSession);
-
-    // Always report to daemon if it exists
-    try {
-        const reportedSessionId = baseSession.id;
-        logger.debug(`[START] Reporting session ${reportedSessionId} to daemon`);
-        const result = await notifyDaemonSessionStarted(reportedSessionId, metadata);
-        if (result.error) {
-            logger.debug(`[START] Failed to report to daemon (may not be running):`, result.error);
-        } else {
-            logger.debug(`[START] Reported session ${reportedSessionId} to daemon`);
-        }
-    } catch (error) {
-        logger.debug('[START] Failed to report to daemon (may not be running):', error);
+        };
+        session = api.sessionSyncClient(persistedSession);
+    } else {
+        const offline = setupOfflineReconnection({
+            api,
+            sessionTag,
+            metadata,
+            state,
+            response,
+            onSessionSwap: (newSession) => {
+                session = newSession;
+                if (permissionHandler) {
+                    permissionHandler.updateSession(newSession);
+                }
+            }
+        });
+        session = offline.session;
+        reconnectionHandle = offline.reconnectionHandle;
+        persistedSession = response;
     }
 
-    const thisSessionId = baseSession.id;
-    await writePersistedHappySession(
-        {
-            id: thisSessionId,
-            metadata: baseSession.metadata,
-            metadataVersion: baseSession.metadataVersion,
-            agentState: baseSession.agentState,
-            agentStateVersion: baseSession.agentStateVersion,
-            encryptionKey: baseSession.encryptionKey,
-            encryptionVariant: baseSession.encryptionVariant,
-        },
-        { flavor: 'codex', vendorResume }
-    );
-    await writeSessionMarker({
-        pid: process.pid,
-        happySessionId: thisSessionId,
-        flavor: 'codex',
-        startedBy: opts.startedBy || 'terminal',
-        cwd: process.cwd(),
-        metadata,
-    });
-    process.once('exit', () => {
-        void removeSessionMarker(process.pid);
-    });
+    const reportedSessionId = attached ? attached.sessionId : response?.id;
+    if (reportedSessionId) {
+        try {
+            logger.debug(`[START] Reporting session ${reportedSessionId} to daemon`);
+            const result = await notifyDaemonSessionStarted(reportedSessionId, metadata);
+            if (result.error) {
+                logger.debug(`[START] Failed to report to daemon (may not be running):`, result.error);
+            } else {
+                logger.debug(`[START] Reported session ${reportedSessionId} to daemon`);
+            }
+        } catch (error) {
+            logger.debug('[START] Failed to report to daemon (may not be running):', error);
+        }
+    }
+
+    if (persistedSession) {
+        await writePersistedHappySession(
+            {
+                id: persistedSession.id,
+                metadata: persistedSession.metadata,
+                metadataVersion: persistedSession.metadataVersion,
+                agentState: persistedSession.agentState,
+                agentStateVersion: persistedSession.agentStateVersion,
+                encryptionKey: persistedSession.encryptionKey,
+                encryptionVariant: persistedSession.encryptionVariant,
+            },
+            { flavor: 'codex', vendorResume }
+        );
+        await writeSessionMarker({
+            pid: process.pid,
+            happySessionId: persistedSession.id,
+            flavor: 'codex',
+            startedBy: opts.startedBy || 'terminal',
+            cwd: process.cwd(),
+            metadata,
+        });
+        process.once('exit', () => {
+            void removeSessionMarker(process.pid);
+        });
+    }
 
     const messageQueue = new MessageQueue2<EnhancedMode>((mode) => hashObject({
         permissionMode: mode.permissionMode,
@@ -194,21 +216,17 @@ export async function runCodex(opts: {
     }));
 
     // Track current overrides to apply per message
-    let currentPermissionMode: PermissionMode | undefined = undefined;
+    // Use shared PermissionMode type from api/types for cross-agent compatibility
+    let currentPermissionMode: import('@/api/types').PermissionMode | undefined = undefined;
     let currentModel: string | undefined = undefined;
 
     session.onUserMessage((message) => {
-        // Resolve permission mode (validate)
+        // Resolve permission mode (accept all modes, will be mapped in switch statement)
         let messagePermissionMode = currentPermissionMode;
         if (message.meta?.permissionMode) {
-            const validModes: PermissionMode[] = ['default', 'read-only', 'safe-yolo', 'yolo'];
-            if (validModes.includes(message.meta.permissionMode as PermissionMode)) {
-                messagePermissionMode = message.meta.permissionMode as PermissionMode;
-                currentPermissionMode = messagePermissionMode;
-                logger.debug(`[Codex] Permission mode updated from user message to: ${currentPermissionMode}`);
-            } else {
-                logger.debug(`[Codex] Invalid permission mode received: ${message.meta.permissionMode}`);
-            }
+            messagePermissionMode = message.meta.permissionMode as import('@/api/types').PermissionMode;
+            currentPermissionMode = messagePermissionMode;
+            logger.debug(`[Codex] Permission mode updated from user message to: ${currentPermissionMode}`);
         } else {
             logger.debug(`[Codex] User message received with no permission mode override, using current: ${currentPermissionMode ?? 'default (effective)'}`);
         }
@@ -227,7 +245,13 @@ export async function runCodex(opts: {
             permissionMode: messagePermissionMode || 'default',
             model: messageModel,
         };
-        messageQueue.push(message.content.text, enhancedMode);
+
+        const specialCommand = parseSpecialCommand(message.content.text);
+        if (specialCommand.type === 'clear') {
+            messageQueue.pushIsolateAndClear(message.content.text, enhancedMode);
+        } else {
+            messageQueue.push(message.content.text, enhancedMode);
+        }
     });
     let thinking = false;
     session.keepAlive(thinking, 'remote');
@@ -291,12 +315,9 @@ export async function runCodex(opts: {
                 storedSessionIdForResume = client.storeSessionForResume();
                 logger.debug('[Codex] Stored session for resume:', storedSessionIdForResume);
             }
-            
+
             abortController.abort();
-            messageQueue.reset();
-            permissionHandler.reset();
             reasoningProcessor.abort();
-            diffProcessor.reset();
             logger.debug('[Codex] Abort completed - session remains active');
         } catch (error) {
             logger.debug('[Codex] Error during abort:', error);
@@ -326,11 +347,18 @@ export async function runCodex(opts: {
                     archivedBy: 'cli',
                     archiveReason: 'User terminated'
                 }));
-                
+
                 // Send session death message
                 session.sendSessionDeath();
                 await session.flush();
                 await session.close();
+            }
+
+            // Force close Codex transport (best-effort) so we don't leave stray processes
+            try {
+                await client.forceCloseSession();
+            } catch (e) {
+                logger.debug('[Codex] Error while force closing Codex session during termination', e);
             }
 
             // Stop caffeinate
@@ -390,6 +418,64 @@ export async function runCodex(opts: {
     //
 
     const client = new CodexMcpClient();
+    /**
+     * Some Codex MCP deployments stream `task_complete` / `turn_aborted` events but
+     * do not reliably resolve the underlying MCP tool call (`codex` / `codex-reply`).
+     *
+     * If we await the tool call forever, the main loop never returns to
+     * `MessageQueue2.waitForMessages...` and new user messages get queued but never
+     * processed.
+     *
+     * To keep the session responsive, we abort the in-flight MCP tool call when we
+     * observe a terminal event for the turn.
+     */
+    let inFlightToolAbortController: AbortController | null = null;
+    let inFlightToolAbortTimer: NodeJS.Timeout | null = null;
+    let lastTurnTerminalEvent: 'task_complete' | 'turn_aborted' | null = null;
+
+    function isAbortError(error: unknown): boolean {
+        return error instanceof Error && error.name === 'AbortError';
+    }
+
+    function scheduleAbortInFlightToolCall(reason: string, controller: AbortController): void {
+        if (inFlightToolAbortTimer) {
+            clearTimeout(inFlightToolAbortTimer);
+            inFlightToolAbortTimer = null;
+        }
+        // Give Codex MCP a short chance to resolve the tool call naturally after emitting a terminal event.
+        // Some deployments never resolve, which deadlocks the main loop unless we abort.
+        inFlightToolAbortTimer = setTimeout(() => {
+            // Only abort the exact in-flight controller that was active when we scheduled this timer.
+            // Codex may deliver terminal events late (after the tool call finished); in that case we
+            // must not abort a subsequent turn's tool call.
+            if (inFlightToolAbortController === controller && !controller.signal.aborted) {
+                logger.debug(`[Codex] Aborting in-flight tool call (${reason}) after terminal event grace period`);
+                controller.abort();
+            }
+        }, 1000);
+    }
+
+    function anyAbortSignal(signals: AbortSignal[]): AbortSignal {
+        const anyFn = (AbortSignal as any)?.any;
+        if (typeof anyFn === 'function') {
+            return anyFn(signals);
+        }
+        // Fallback for older runtimes: best-effort "any" signal (listener cleanup omitted).
+        const controller = new AbortController();
+        const onAbort = () => controller.abort();
+        for (const s of signals) {
+            if (s.aborted) {
+                controller.abort();
+                break;
+            }
+            try {
+                s.addEventListener('abort', onAbort, { once: true });
+            } catch {
+                // ignore
+            }
+        }
+        return controller.signal;
+    }
 
     // Helper: find Codex session transcript for a given sessionId
     function findCodexResumeFile(sessionId: string | null): string | null {
@@ -432,7 +518,7 @@ export async function runCodex(opts: {
             return null;
         }
     }
-    const permissionHandler = new CodexPermissionHandler(session);
+    permissionHandler = new CodexPermissionHandler(session);
     const reasoningProcessor = new ReasoningProcessor((message) => {
         // Callback to send messages directly from the processor
         session.sendCodexMessage(message);
@@ -442,12 +528,65 @@ export async function runCodex(opts: {
         session.sendCodexMessage(message);
     });
     client.setPermissionHandler(permissionHandler);
+
+    function extractCodexToolErrorText(response: CodexToolResponse): string | null {
+        if (!response?.isError) {
+            return null;
+        }
+        const text = (response.content || [])
+            .map((c) => (c && typeof c.text === 'string' ? c.text : ''))
+            .filter(Boolean)
+            .join('\n')
+            .trim();
+        return text || 'Codex error';
+    }
+
+    function forwardCodexStatusToUi(messageText: string): void {
+        messageBuffer.addMessage(messageText, 'status');
+        session.sendSessionEvent({ type: 'message', message: messageText });
+    }
+
+    function forwardCodexErrorToUi(errorText: string): void {
+        forwardCodexStatusToUi(`Codex error: ${errorText}`);
+    }
+
     client.setHandler((msg) => {
         logger.debug(`[Codex] MCP message: ${JSON.stringify(msg)}`);
+
+        if (msg?.type === 'session_configured') {
+            const nextId =
+                (msg as any)?.session_id
+                ?? (msg as any)?.sessionId
+                ?? (msg as any)?.session_id
+                ?? (msg as any)?.sessionId;
+            if (typeof nextId === 'string' && nextId) {
+                session.updateMetadata((currentMetadata) => {
+                    if (currentMetadata.codexSessionId) {
+                        return currentMetadata;
+                    }
+                    return {
+                        ...currentMetadata,
+                        codexSessionId: nextId,
+                    };
+                });
+            }
+        }
 
         // Add messages to the ink UI buffer based on message type
         if (msg.type === 'agent_message') {
             messageBuffer.addMessage(msg.message, 'assistant');
+        } else if (msg.type === 'error') {
+            const errorText = typeof msg.message === 'string' && msg.message.trim() ? msg.message.trim() : 'Codex error';
+            forwardCodexErrorToUi(errorText);
+        } else if (msg.type === 'stream_error') {
+            const status = typeof msg.message === 'string' && msg.message.trim() ? msg.message.trim() : 'Codex stream error';
+            forwardCodexStatusToUi(`Codex stream error: ${status}`);
+        } else if (msg.type === 'mcp_startup_update') {
+            if (msg.status?.state === 'failed') {
+                const errorText = typeof msg.status?.error === 'string' ? msg.status.error : 'MCP server failed to start';
+                const serverName = typeof msg.server === 'string' ? msg.server : 'unknown';
+                forwardCodexStatusToUi(`MCP server "${serverName}" failed to start: ${errorText}`);
+            }
         } else if (msg.type === 'agent_reasoning_delta') {
             // Skip reasoning deltas in the UI to reduce noise
         } else if (msg.type === 'agent_reasoning') {
@@ -464,9 +603,19 @@ export async function runCodex(opts: {
         } else if (msg.type === 'task_started') {
             messageBuffer.addMessage('Starting task...', 'status');
         } else if (msg.type === 'task_complete') {
+            // Only schedule aborts when a tool call is actually in-flight.
+            // Codex can deliver terminal events late (after we already returned to idle).
+            if (inFlightToolAbortController) {
+                lastTurnTerminalEvent = 'task_complete';
+                scheduleAbortInFlightToolCall('task_complete', inFlightToolAbortController);
+            }
             messageBuffer.addMessage('Task completed', 'status');
             sendReady();
         } else if (msg.type === 'turn_aborted') {
+            if (inFlightToolAbortController) {
+                lastTurnTerminalEvent = 'turn_aborted';
+                scheduleAbortInFlightToolCall('turn_aborted', inFlightToolAbortController);
+            }
             messageBuffer.addMessage('Turn aborted', 'status');
             sendReady();
         }
@@ -484,7 +633,8 @@ export async function runCodex(opts: {
                 thinking = false;
                 session.keepAlive(thinking, 'remote');
             }
-            // Reset diff processor on task end or abort
+            // Emit final diff for the turn (once), then reset
+            diffProcessor.flush();
             diffProcessor.reset();
         }
         if (msg.type === 'agent_reasoning_section_break') {
@@ -558,6 +708,7 @@ export async function runCodex(opts: {
 
             // Add UI feedback for completion
             if (success) {
+                diffProcessor.markPatchApplied();
                 const message = stdout || 'Files modified successfully';
                 messageBuffer.addMessage(message.substring(0, 200), 'result');
             } else {
@@ -583,6 +734,29 @@ export async function runCodex(opts: {
                 diffProcessor.processDiff(msg.unified_diff);
             }
         }
+        // Handle MCP tool calls (e.g., change_title from happy server)
+        if (msg.type === 'mcp_tool_call_begin') {
+            const { call_id, invocation } = msg;
+            // Use mcp__ prefix so frontend recognizes it as MCP tool (minimal display)
+            const toolName = `mcp__${invocation.server}__${invocation.tool}`;
+            session.sendCodexMessage({
+                type: 'tool-call',
+                name: toolName,
+                callId: call_id,
+                input: invocation.arguments || {},
+                id: randomUUID()
+            });
+        }
+        if (msg.type === 'mcp_tool_call_end') {
+            const { call_id, result } = msg;
+            const output = result?.Ok || result?.Err || result;
+            session.sendCodexMessage({
+                type: 'tool-call-result',
+                callId: call_id,
+                output: output,
+                id: randomUUID()
+            });
+        }
     });
 
     // Start Happy MCP server (HTTP) and prepare STDIO bridge config for Codex
@@ -601,6 +775,13 @@ export async function runCodex(opts: {
         await client.connect();
         logger.debug('[codex]: client.connect done');
         let wasCreated = false;
+        if (opts.resume && opts.resume.trim()) {
+            const resumeId = opts.resume.trim();
+            client.setResumedConversationId(resumeId);
+            wasCreated = true;
+            first = false;
+            messageBuffer.addMessage(`Resuming Codex session ${resumeId.substring(0, 8)}…`, 'status');
+        }
         let currentModeHash: string | null = null;
         let pending: { message: string; mode: EnhancedMode; isolate: boolean; hash: string } | null = null;
         // If we restart (e.g., mode change), use this to carry a resume file
@@ -614,6 +795,9 @@ export async function runCodex(opts: {
             if (!message) {
                 // Capture the current signal to distinguish idle-abort from queue close
                 const waitSignal = abortController.signal;
+                // If there are server-side pending messages, materialize one into the transcript now.
+                // This ensures sessions remain responsive even when the UI defers message creation.
+                await session.popPendingMessage();
                 const batch = await messageQueue.waitForMessagesAndGetAsString(waitSignal);
                 if (!batch) {
                     // If wait was aborted (e.g., remote abort with no active inference), ignore and continue
@@ -667,24 +851,67 @@ export async function runCodex(opts: {
             messageBuffer.addMessage(message.message, 'user');
             currentModeHash = message.hash;
 
+            const specialCommand = parseSpecialCommand(message.message);
+            if (specialCommand.type === 'clear') {
+                logger.debug('[Codex] Handling /clear command - resetting session');
+                client.clearSession();
+                wasCreated = false;
+                currentModeHash = null;
+
+                // Reset processors/permissions
+                permissionHandler.reset();
+                reasoningProcessor.abort();
+                diffProcessor.reset();
+                thinking = false;
+                session.keepAlive(thinking, 'remote');
+
+                messageBuffer.addMessage('Session reset.', 'status');
+                emitReadyIfIdle({
+                    pending,
+                    queueSize: () => messageQueue.size(),
+                    shouldExit,
+                    sendReady,
+                });
+                continue;
+            }
+
             try {
                 // Map permission mode to approval policy and sandbox for startSession
                 const approvalPolicy = (() => {
                     switch (message.mode.permissionMode) {
-                        case 'default': return 'untrusted' as const;
-                        case 'read-only': return 'never' as const;
-                        case 'safe-yolo': return 'on-failure' as const;
-                        case 'yolo': return 'on-failure' as const;
+                        // Codex native modes
+                        case 'default': return 'untrusted' as const;                    // Ask for non-trusted commands
+                        case 'read-only': return 'never' as const;                      // Never ask, read-only enforced by sandbox
+                        case 'safe-yolo': return 'on-failure' as const;                 // Auto-run, ask only on failure
+                        case 'yolo': return 'on-failure' as const;                      // Auto-run, ask only on failure
+                        // Defensive fallback for Claude-specific modes (backward compatibility)
+                        case 'bypassPermissions': return 'on-failure' as const;         // Full access: map to yolo behavior
+                        case 'acceptEdits': return 'on-request' as const;               // Let model decide (closest to auto-approve edits)
+                        case 'plan': return 'untrusted' as const;                       // Conservative: ask for non-trusted
+                        default: return 'untrusted' as const;                           // Safe fallback
                     }
                 })();
                 const sandbox = (() => {
                     switch (message.mode.permissionMode) {
-                        case 'default': return 'workspace-write' as const;
-                        case 'read-only': return 'read-only' as const;
-                        case 'safe-yolo': return 'workspace-write' as const;
-                        case 'yolo': return 'danger-full-access' as const;
+                        // Codex native modes
+                        case 'default': return 'workspace-write' as const;              // Can write in workspace
+                        case 'read-only': return 'read-only' as const;                  // Read-only filesystem
+                        case 'safe-yolo': return 'workspace-write' as const;            // Can write in workspace
+                        case 'yolo': return 'danger-full-access' as const;              // Full system access
+                        // Defensive fallback for Claude-specific modes
+                        case 'bypassPermissions': return 'danger-full-access' as const; // Full access: map to yolo
+                        case 'acceptEdits': return 'workspace-write' as const;          // Can edit files in workspace
+                        case 'plan': return 'workspace-write' as const;                 // Can write for planning
+                        default: return 'workspace-write' as const;                     // Safe default
                     }
                 })();
+
+                // Per-turn terminal state + per-tool-call abort controller. We may abort the MCP tool call
+                // after terminal events to avoid getting stuck if Codex does not resolve the tool response.
+                lastTurnTerminalEvent = null;
+                const toolAbortController = new AbortController();
+                inFlightToolAbortController = toolAbortController;
+                const toolSignal = anyAbortSignal([abortController.signal, toolAbortController.signal]);
 
                 if (!wasCreated) {
                     const startConfig: CodexSessionConfig = {
@@ -696,10 +923,10 @@ export async function runCodex(opts: {
                     if (message.mode.model) {
                         startConfig.model = message.mode.model;
                     }
-                    
+
                     // Check for resume file from multiple sources
                     let resumeFile: string | null = null;
-                    
+
                     // Priority 1: Explicit resume file from mode change
                     if (nextExperimentalResume) {
                         resumeFile = nextExperimentalResume;
@@ -716,40 +943,61 @@ export async function runCodex(opts: {
                         }
                         storedSessionIdForResume = null; // consume once
                     }
-                    
+
                     // Apply resume file if found
                     if (resumeFile) {
                         (startConfig.config as any).experimental_resume = resumeFile;
                     }
-                    
-                    await client.startSession(
+                    const startResponse = await client.startSession(
                         startConfig,
-                        { signal: abortController.signal }
+                        { signal: toolSignal }
                     );
+                    const startError = extractCodexToolErrorText(startResponse);
+                    if (startError) {
+                        forwardCodexErrorToUi(startError);
+                        client.clearSession();
+                        wasCreated = false;
+                        currentModeHash = null;
+                        continue;
+                    }
                     wasCreated = true;
                     first = false;
                 } else {
                     const response = await client.continueSession(
                         message.message,
-                        { signal: abortController.signal }
+                        { signal: toolSignal }
                     );
                     logger.debug('[Codex] continueSession response:', response);
+                    const continueError = extractCodexToolErrorText(response);
+                    if (continueError) {
+                        forwardCodexErrorToUi(continueError);
+                        client.clearSession();
+                        wasCreated = false;
+                        currentModeHash = null;
+                        continue;
+                    }
                 }
             } catch (error) {
                 logger.warn('Error in codex session:', error);
-                const isAbortError = error instanceof Error && error.name === 'AbortError';
-                
-                if (isAbortError) {
+                const isAbort = isAbortError(error);
+
+                // If we aborted the MCP tool call after Codex already finished the turn, don't
+                // surface it as a user abort. This keeps the queue consumer alive.
+                if (isAbort && lastTurnTerminalEvent === 'task_complete') {
+                    logger.debug('[Codex] Ignoring AbortError triggered by task_complete');
+                } else if (isAbort && lastTurnTerminalEvent === 'turn_aborted') {
+                    logger.debug('[Codex] Ignoring AbortError triggered by turn_aborted');
+                } else if (isAbort) {
                     messageBuffer.addMessage('Aborted by user', 'status');
                     session.sendSessionEvent({ type: 'message', message: 'Aborted by user' });
-                    // Session was already stored in handleAbort(), no need to store again
-                    // Mark session as not created to force proper resume on next message
-                    wasCreated = false;
-                    currentModeHash = null;
-                    logger.debug('[Codex] Marked session as not created after abort for proper resume');
+                    // Abort cancels the current task/inference but keeps the Codex session alive.
+                    // Do not clear session state here; the next user message should continue on the
+                    // existing session if possible.
                 } else {
-                    messageBuffer.addMessage('Process exited unexpectedly', 'status');
-                    session.sendSessionEvent({ type: 'message', message: 'Process exited unexpectedly' });
+                    const details = formatErrorForUi(error);
+                    const messageText = `Codex process error: ${details}`;
+                    messageBuffer.addMessage(messageText, 'status');
+                    session.sendSessionEvent({ type: 'message', message: messageText });
                     // For unexpected exits, try to store session for potential recovery
                     if (client.hasActiveSession()) {
                         storedSessionIdForResume = client.storeSessionForResume();
@@ -757,18 +1005,28 @@ export async function runCodex(opts: {
                     }
                 }
             } finally {
+                inFlightToolAbortController = null;
+                lastTurnTerminalEvent = null;
+                if (inFlightToolAbortTimer) {
+                    clearTimeout(inFlightToolAbortTimer);
+                    inFlightToolAbortTimer = null;
+                }
                 // Reset permission handler, reasoning processor, and diff processor
                 permissionHandler.reset();
                 reasoningProcessor.abort();  // Use abort to properly finish any in-progress tool calls
+                diffProcessor.flush();
                 diffProcessor.reset();
                 thinking = false;
                 session.keepAlive(thinking, 'remote');
-                emitReadyIfIdle({
-                    pending,
-                    queueSize: () => messageQueue.size(),
-                    shouldExit,
-                    sendReady,
-                });
+                const popped = !shouldExit ? await session.popPendingMessage() : false;
+                if (!popped) {
+                    emitReadyIfIdle({
+                        pending,
+                        queueSize: () => messageQueue.size(),
+                        shouldExit,
+                        sendReady,
+                    });
+                }
                 logActiveHandles('after-turn');
             }
         }
@@ -777,6 +1035,13 @@ export async function runCodex(opts: {
         // Clean up resources when main loop exits
         logger.debug('[codex]: Final cleanup start');
         logActiveHandles('cleanup-start');
+
+        // Cancel offline reconnection if still running
+        if (reconnectionHandle) {
+            logger.debug('[codex]: Cancelling offline reconnection');
+            reconnectionHandle.cancel();
+        }
+
         try {
             logger.debug('[codex]: sendSessionDeath');
             session.sendSessionDeath();
@@ -789,9 +1054,9 @@ export async function runCodex(opts: {
         } catch (e) {
             logger.debug('[codex]: Error while closing session', e);
         }
-        logger.debug('[codex]: client.disconnect begin');
-        await client.disconnect();
-        logger.debug('[codex]: client.disconnect done');
+        logger.debug('[codex]: client.forceCloseSession begin');
+        await client.forceCloseSession();
+        logger.debug('[codex]: client.forceCloseSession done');
         // Stop Happy MCP server
         logger.debug('[codex]: happyServer.stop');
         happyServer.stop();

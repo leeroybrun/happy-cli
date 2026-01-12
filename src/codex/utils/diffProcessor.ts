@@ -7,6 +7,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { logger } from '@/ui/logger';
+import { configuration } from '@/configuration';
 
 export interface DiffToolCall {
     type: 'tool-call';
@@ -29,6 +30,8 @@ export interface DiffToolResult {
 
 export class DiffProcessor {
     private previousDiff: string | null = null;
+    private sentDiff: string | null = null;
+    private patchAppliedThisTurn: boolean = false;
     private onMessage: ((message: any) => void) | null = null;
 
     constructor(onMessage?: (message: any) => void) {
@@ -39,42 +42,54 @@ export class DiffProcessor {
      * Process a turn_diff message and check if the unified_diff has changed
      */
     processDiff(unifiedDiff: string): void {
-        // Check if the diff has changed from the previous value
-        if (this.previousDiff !== unifiedDiff) {
-            logger.debug('[DiffProcessor] Unified diff changed, sending CodexDiff tool call');
-            
-            // Generate a unique call ID for this diff
-            const callId = randomUUID();
-            
-            // Send tool call for the diff change
-            const toolCall: DiffToolCall = {
-                type: 'tool-call',
-                name: 'CodexDiff',
-                callId: callId,
-                input: {
-                    unified_diff: unifiedDiff
-                },
-                id: randomUUID()
-            };
-            
-            this.onMessage?.(toolCall);
-            
-            // Immediately send the tool result to mark it as completed
-            const toolResult: DiffToolResult = {
-                type: 'tool-call-result',
-                callId: callId,
-                output: {
-                    status: 'completed'
-                },
-                id: randomUUID()
-            };
-            
-            this.onMessage?.(toolResult);
+        if (configuration.disableCodexDiffs) {
+            this.previousDiff = unifiedDiff;
+            logger.debug('[DiffProcessor] Codex diff emission disabled (HAPPY_DISABLE_CODEX_DIFFS/HAPPY_DISABLE_DIFFS)');
+            return;
         }
-        
-        // Update the stored diff value
         this.previousDiff = unifiedDiff;
-        logger.debug('[DiffProcessor] Updated stored diff');
+        logger.debug('[DiffProcessor] Updated stored diff (buffered)');
+    }
+
+    /**
+     * Emit the latest diff once (typically at end-of-turn) to avoid spamming intermediate updates.
+     */
+    flush(): void {
+        if (configuration.disableCodexDiffs) {
+            return;
+        }
+        if (this.patchAppliedThisTurn) {
+            logger.debug('[DiffProcessor] Skipping CodexDiff flush because a patch was applied this turn');
+            return;
+        }
+        const unifiedDiff = this.previousDiff;
+        if (!unifiedDiff) {
+            return;
+        }
+        if (this.sentDiff === unifiedDiff) {
+            return;
+        }
+        logger.debug('[DiffProcessor] Flushing unified diff as CodexDiff tool call');
+
+        const callId = randomUUID();
+        const toolCall: DiffToolCall = {
+            type: 'tool-call',
+            name: 'CodexDiff',
+            callId,
+            input: { unified_diff: unifiedDiff },
+            id: randomUUID(),
+        };
+        this.onMessage?.(toolCall);
+
+        const toolResult: DiffToolResult = {
+            type: 'tool-call-result',
+            callId,
+            output: { status: 'completed' },
+            id: randomUUID(),
+        };
+        this.onMessage?.(toolResult);
+
+        this.sentDiff = unifiedDiff;
     }
 
     /**
@@ -83,6 +98,14 @@ export class DiffProcessor {
     reset(): void {
         logger.debug('[DiffProcessor] Resetting diff state');
         this.previousDiff = null;
+        this.patchAppliedThisTurn = false;
+    }
+
+    /**
+     * Mark that a structured patch was applied this turn; we can prefer CodexPatch diffs over turn diffs.
+     */
+    markPatchApplied(): void {
+        this.patchAppliedThisTurn = true;
     }
 
     /**

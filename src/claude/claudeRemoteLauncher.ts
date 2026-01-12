@@ -15,6 +15,7 @@ import { EnhancedMode } from "./loop";
 import { RawJSONLines } from "@/claude/types";
 import { OutgoingMessageQueue } from "./utils/OutgoingMessageQueue";
 import { getToolName } from "./utils/getToolName";
+import { formatErrorForUi } from "@/utils/formatErrorForUi";
 
 interface PermissionsField {
     date: number;
@@ -343,6 +344,13 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             return p;
                         }
 
+                        // If the queue is empty, try to materialize one server-side pending item into the transcript.
+                        // This allows the mobile/web UI to enqueue messages without immediately committing them to the
+                        // transcript; the agent will pull them when ready for the next turn.
+                        if (session.queue.size() === 0) {
+                            await session.client.popPendingMessage();
+                        }
+
                         let msg = await session.queue.waitForMessagesAndGetAsString(controller.signal);
 
                         // Check if mode has changed
@@ -403,7 +411,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             } catch (e) {
                 logger.debug('[remote]: launch error', e);
                 if (!exitReason) {
-                    session.client.sendSessionEvent({ type: 'message', message: 'Process exited unexpectedly' });
+                    session.client.sendSessionEvent({ type: 'message', message: `Claude process error: ${formatErrorForUi(e)}` });
                     continue;
                 }
             } finally {

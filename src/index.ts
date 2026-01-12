@@ -88,16 +88,25 @@ import { execFileSync } from 'node:child_process'
       
       // Parse startedBy argument
       let startedBy: 'daemon' | 'terminal' | undefined = undefined;
+      let resume: string | undefined = undefined;
       for (let i = 1; i < args.length; i++) {
         if (args[i] === '--started-by') {
           startedBy = args[++i] as 'daemon' | 'terminal';
+        } else if (args[i] === '--resume') {
+          const nextArg = args[i + 1];
+          if (!nextArg || nextArg.startsWith('-')) {
+            console.error(chalk.red('Error: --resume requires a Codex session ID'));
+            process.exit(1);
+          }
+          resume = nextArg;
+          i++; // consume value
         }
       }
       
       const {
         credentials
       } = await authAndSetupMachineIfNeeded();
-      await runCodex({credentials, startedBy});
+      await runCodex({credentials, startedBy, resume});
       // Do not force exit here; allow instrumentation to show lingering handles
     } catch (error) {
       console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
@@ -504,9 +513,9 @@ ${chalk.bold.cyan('Claude Code Options (from `claude --help`):')}
 `)
       
       // Run claude --help and display its output
-      // Use execFileSync with the current Node executable for cross-platform compatibility
+      // Use execFileSync directly with claude CLI for runtime-agnostic compatibility
       try {
-        const claudeHelp = execFileSync(process.execPath, [claudeCliPath, '--help'], { encoding: 'utf8' })
+        const claudeHelp = execFileSync(claudeCliPath, ['--help'], { encoding: 'utf8' })
         console.log(claudeHelp)
       } catch (e) {
         console.log(chalk.yellow('Could not retrieve claude help. Make sure claude is installed.'))

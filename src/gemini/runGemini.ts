@@ -15,7 +15,7 @@ import { join, resolve } from 'node:path';
 import { ApiClient } from '@/api/api';
 import { logger } from '@/ui/logger';
 import { Credentials, readSettings } from '@/persistence';
-import { AgentState, Metadata } from '@/api/types';
+import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { initialMachineMetadata } from '@/daemon/run';
 import { configuration } from '@/configuration';
 import packageJson from '../../package.json';
@@ -28,6 +28,10 @@ import { notifyDaemonSessionStarted } from '@/daemon/controlClient';
 import { registerKillSessionHandler } from '@/claude/registerKillSessionHandler';
 import { stopCaffeinate } from '@/utils/caffeinate';
 import { readPersistedHappySession, removeSessionMarker, writePersistedHappySession, writeSessionMarker } from '@/daemon/sessionRegistry';
+import { formatErrorForUi } from '@/utils/formatErrorForUi';
+import { connectionState } from '@/utils/serverConnectionErrors';
+import { setupOfflineReconnection } from '@/utils/setupOfflineReconnection';
+import type { ApiSessionClient } from '@/api/apiSession';
 
 import { createGeminiBackend } from '@/agent/acp/gemini';
 import type { AgentBackend, AgentMessage } from '@/agent/AgentBackend';
@@ -35,7 +39,8 @@ import { GeminiDisplay } from '@/ui/ink/GeminiDisplay';
 import { GeminiPermissionHandler } from '@/gemini/utils/permissionHandler';
 import { GeminiReasoningProcessor } from '@/gemini/utils/reasoningProcessor';
 import { GeminiDiffProcessor } from '@/gemini/utils/diffProcessor';
-import type { PermissionMode, GeminiMode, CodexMessagePayload } from '@/gemini/types';
+import type { GeminiMode, CodexMessagePayload } from '@/gemini/types';
+import type { PermissionMode } from '@/api/types';
 import { GEMINI_MODEL_ENV, DEFAULT_GEMINI_MODEL, CHANGE_TITLE_INSTRUCTION } from '@/gemini/constants';
 import { 
   readGeminiLocalConfig, 
@@ -63,6 +68,10 @@ export async function runGemini(opts: {
 
   
   const sessionTag = randomUUID();
+
+  // Set backend for offline warnings (before any API calls)
+  connectionState.setBackend('Gemini');
+
   const api = await ApiClient.create(opts.credentials);
 
 
@@ -100,26 +109,12 @@ export async function runGemini(opts: {
   // Create session
   //
 
-  const state: AgentState = {
-    controlledByUser: false,
-  };
-  const metadata: Metadata = {
-    path: process.cwd(),
-    host: os.hostname(),
-    version: packageJson.version,
-    os: os.platform(),
-    machineId: machineId,
-    homeDir: os.homedir(),
-    happyHomeDir: configuration.happyHomeDir,
-    happyLibDir: projectPath(),
-    happyToolsDir: resolve(projectPath(), 'tools', 'unpacked'),
-    startedFromDaemon: opts.startedBy === 'daemon',
-    hostPid: process.pid,
-    startedBy: opts.startedBy || 'terminal',
-    lifecycleState: 'running',
-    lifecycleStateSince: Date.now(),
-    flavor: 'gemini'
-  };
+  const { state, metadata } = createSessionMetadata({
+    flavor: 'gemini',
+    machineId,
+    startedBy: opts.startedBy
+  });
+
   const argv = process.argv.slice(2);
   const happySessionArgIdx = argv.findIndex((v) => v === '--happy-session');
   const happySessionId = happySessionArgIdx >= 0 ? argv[happySessionArgIdx + 1] : null;
@@ -129,57 +124,86 @@ export async function runGemini(opts: {
     throw new Error(`Cannot attach to session ${happySessionId}: no local persisted session state found`);
   }
 
-  const baseSession = attached
-    ? {
-        id: attached.sessionId,
-        seq: 0,
-        metadata: attached.metadata,
-        metadataVersion: attached.metadataVersion,
-        agentState: attached.agentState,
-        agentStateVersion: attached.agentStateVersion,
-        encryptionKey: new Uint8Array(Buffer.from(attached.encryptionKeyBase64, 'base64')),
-        encryptionVariant: attached.encryptionVariant,
+  // Permission handler declared here so it can be updated in onSessionSwap callback
+  // (assigned later after Happy server setup)
+  let permissionHandler: GeminiPermissionHandler;
+  let reconnectionHandle: { cancel: () => void } | null = null;
+
+  let session: ApiSessionClient;
+  let persistedSession: any = null;
+
+  const response = attached ? null : await api.getOrCreateSession({ tag: sessionTag, metadata, state });
+  if (attached) {
+    persistedSession = {
+      id: attached.sessionId,
+      seq: 0,
+      metadata: attached.metadata,
+      metadataVersion: attached.metadataVersion,
+      agentState: attached.agentState,
+      agentStateVersion: attached.agentStateVersion,
+      encryptionKey: new Uint8Array(Buffer.from(attached.encryptionKeyBase64, 'base64')),
+      encryptionVariant: attached.encryptionVariant,
+    };
+    session = api.sessionSyncClient(persistedSession);
+  } else {
+    const offline = setupOfflineReconnection({
+      api,
+      sessionTag,
+      metadata,
+      state,
+      response,
+      onSessionSwap: (newSession) => {
+        session = newSession;
+        if (permissionHandler) {
+          permissionHandler.updateSession(newSession);
+        }
       }
-    : await api.getOrCreateSession({ tag: sessionTag, metadata, state });
-
-  const session = api.sessionSyncClient(baseSession);
-
-  // Report to daemon
-  try {
-    logger.debug(`[START] Reporting session ${baseSession.id} to daemon`);
-    const result = await notifyDaemonSessionStarted(baseSession.id, metadata);
-    if (result.error) {
-      logger.debug(`[START] Failed to report to daemon (may not be running):`, result.error);
-    } else {
-      logger.debug(`[START] Reported session ${baseSession.id} to daemon`);
-    }
-  } catch (error) {
-    logger.debug('[START] Failed to report to daemon (may not be running):', error);
+    });
+    session = offline.session;
+    reconnectionHandle = offline.reconnectionHandle;
+    persistedSession = response;
   }
 
-  await writePersistedHappySession(
-    {
-      id: baseSession.id,
-      metadata: baseSession.metadata,
-      metadataVersion: baseSession.metadataVersion,
-      agentState: baseSession.agentState,
-      agentStateVersion: baseSession.agentStateVersion,
-      encryptionKey: baseSession.encryptionKey,
-      encryptionVariant: baseSession.encryptionVariant,
-    },
-    { flavor: 'gemini' }
-  );
-  await writeSessionMarker({
-    pid: process.pid,
-    happySessionId: baseSession.id,
-    flavor: 'gemini',
-    startedBy: opts.startedBy || 'terminal',
-    cwd: process.cwd(),
-    metadata,
-  });
-  process.once('exit', () => {
-    void removeSessionMarker(process.pid);
-  });
+  const reportedSessionId = attached ? attached.sessionId : response?.id;
+  if (reportedSessionId) {
+    try {
+      logger.debug(`[START] Reporting session ${reportedSessionId} to daemon`);
+      const result = await notifyDaemonSessionStarted(reportedSessionId, metadata);
+      if (result.error) {
+        logger.debug(`[START] Failed to report to daemon (may not be running):`, result.error);
+      } else {
+        logger.debug(`[START] Reported session ${reportedSessionId} to daemon`);
+      }
+    } catch (error) {
+      logger.debug('[START] Failed to report to daemon (may not be running):', error);
+    }
+  }
+
+  if (persistedSession) {
+    await writePersistedHappySession(
+      {
+        id: persistedSession.id,
+        metadata: persistedSession.metadata,
+        metadataVersion: persistedSession.metadataVersion,
+        agentState: persistedSession.agentState,
+        agentStateVersion: persistedSession.agentStateVersion,
+        encryptionKey: persistedSession.encryptionKey,
+        encryptionVariant: persistedSession.encryptionVariant,
+      },
+      { flavor: 'gemini' }
+    );
+    await writeSessionMarker({
+      pid: process.pid,
+      happySessionId: persistedSession.id,
+      flavor: 'gemini',
+      startedBy: opts.startedBy || 'terminal',
+      cwd: process.cwd(),
+      metadata,
+    });
+    process.once('exit', () => {
+      void removeSessionMarker(process.pid);
+    });
+  }
 
   const messageQueue = new MessageQueue2<GeminiMode>((mode) => hashObject({
     permissionMode: mode.permissionMode,
@@ -475,8 +499,8 @@ export async function runGemini(opts: {
     }
   };
 
-  // Create permission handler for tool approval
-  const permissionHandler = new GeminiPermissionHandler(session);
+  // Create permission handler for tool approval (variable declared earlier for onSessionSwap)
+  permissionHandler = new GeminiPermissionHandler(session);
   
   // Create reasoning processor for handling thinking/reasoning chunks
   const reasoningProcessor = new GeminiReasoningProcessor((message) => {
@@ -880,6 +904,9 @@ export async function runGemini(opts: {
       if (!message) {
         logger.debug('[gemini] Main loop: waiting for messages from queue...');
         const waitSignal = abortController.signal;
+        // If there are server-side pending messages, materialize one into the transcript now.
+        // This keeps the agent responsive even when the UI defers message creation.
+        await session.popPendingMessage();
         const batch = await messageQueue.waitForMessagesAndGetAsString(waitSignal);
         if (!batch) {
           if (waitSignal.aborted && !shouldExit) {
@@ -1085,7 +1112,7 @@ export async function runGemini(opts: {
               errorMsg = errorDetails || errorMessage || errObj.message;
             }
           } else if (error instanceof Error) {
-            errorMsg = error.message;
+            errorMsg = formatErrorForUi(error);
           }
           
           messageBuffer.addMessage(errorMsg, 'status');
@@ -1105,8 +1132,11 @@ export async function runGemini(opts: {
         thinking = false;
         session.keepAlive(thinking, 'remote');
         
-        // Use same logic as Codex - emit ready if idle (no pending operations, no queue)
-        emitReadyIfIdle();
+        const popped = !shouldExit ? await session.popPendingMessage() : false;
+        if (!popped) {
+          // Use same logic as Codex - emit ready if idle (no pending operations, no queue)
+          emitReadyIfIdle();
+        }
         
         logger.debug(`[gemini] Main loop: turn completed, continuing to next iteration (queue size: ${messageQueue.size()})`);
       }
@@ -1115,6 +1145,13 @@ export async function runGemini(opts: {
   } finally {
     // Clean up resources
     logger.debug('[gemini]: Final cleanup start');
+
+    // Cancel offline reconnection if still running
+    if (reconnectionHandle) {
+      logger.debug('[gemini]: Cancelling offline reconnection');
+      reconnectionHandle.cancel();
+    }
+
     try {
       session.sendSessionDeath();
       await session.flush();
@@ -1145,4 +1182,3 @@ export async function runGemini(opts: {
     logger.debug('[gemini]: Final cleanup completed');
   }
 }
-
