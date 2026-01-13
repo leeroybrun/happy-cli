@@ -30,6 +30,7 @@ export class Session {
      * Used to carry permission settings across remote ↔ local mode switches.
      */
     lastPermissionMode: PermissionMode = 'default';
+    lastPermissionModeUpdatedAt: number = 0;
     
     /** Callbacks to be notified when session ID is found/changed */
     private sessionFoundCallbacks: ((sessionId: string) => void)[] = [];
@@ -82,6 +83,16 @@ export class Session {
         clearInterval(this.keepAliveInterval);
         this.sessionFoundCallbacks = [];
         logger.debug('[Session] Cleaned up resources');
+    }
+
+    setLastPermissionMode = (mode: PermissionMode, updatedAt: number = Date.now()): void => {
+        this.lastPermissionMode = mode;
+        this.lastPermissionModeUpdatedAt = updatedAt;
+        this.client.updateMetadata((metadata) => ({
+            ...metadata,
+            permissionMode: mode,
+            permissionModeUpdatedAt: updatedAt
+        }));
     }
 
     onThinkingChange = (thinking: boolean) => {

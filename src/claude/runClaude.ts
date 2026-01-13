@@ -43,6 +43,33 @@ export interface StartOptions {
     jsRuntime?: JsRuntime
 }
 
+function inferPermissionModeFromClaudeArgs(args?: string[]): PermissionMode | undefined {
+    const input = args ?? [];
+    let inferred: PermissionMode | undefined;
+
+    for (let i = 0; i < input.length; i++) {
+        const arg = input[i];
+
+        if (arg === '--dangerously-skip-permissions') {
+            inferred = 'bypassPermissions';
+            continue;
+        }
+
+        if (arg === '--permission-mode') {
+            const next = i + 1 < input.length ? input[i + 1] : undefined;
+            if (next && !next.startsWith('-')) {
+                if (next === 'default' || next === 'acceptEdits' || next === 'bypassPermissions' || next === 'plan') {
+                    inferred = next as PermissionMode;
+                }
+                i++; // consume value
+            }
+            continue;
+        }
+    }
+
+    return inferred;
+}
+
 export async function runClaude(credentials: Credentials, options: StartOptions = {}): Promise<void> {
     logger.debug(`[CLAUDE] ===== CLAUDE MODE STARTING =====`);
     logger.debug(`[CLAUDE] This is the Claude agent, NOT Gemini`);
@@ -83,6 +110,11 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         metadata: initialMachineMetadata
     });
 
+    // Resolve initial permission mode for sessions that start in terminal local mode.
+    // This is important because there may be no app-sent user messages yet (no meta.permissionMode to infer from).
+    const initialPermissionMode = options.permissionMode ?? inferPermissionModeFromClaudeArgs(options.claudeArgs) ?? 'default';
+    options.permissionMode = initialPermissionMode;
+
     let metadata: Metadata = {
         path: workingDirectory,
         host: os.hostname(),
@@ -99,7 +131,9 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         // Initialize lifecycle state
         lifecycleState: 'running',
         lifecycleStateSince: Date.now(),
-        flavor: 'claude'
+        flavor: 'claude',
+        permissionMode: initialPermissionMode,
+        permissionModeUpdatedAt: Date.now(),
     };
     const response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
 
