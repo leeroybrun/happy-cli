@@ -3,6 +3,7 @@ import { MessageQueue2 } from "@/utils/MessageQueue2";
 import { EnhancedMode } from "./loop";
 import { logger } from "@/ui/logger";
 import type { JsRuntime } from "./runClaude";
+import type { PermissionMode } from "@/api/types";
 
 export class Session {
     readonly path: string;
@@ -23,6 +24,12 @@ export class Session {
     sessionId: string | null;
     mode: 'local' | 'remote' = 'local';
     thinking: boolean = false;
+
+    /**
+     * Last known permission mode for this session, derived from message metadata / permission responses.
+     * Used to carry permission settings across remote ↔ local mode switches.
+     */
+    lastPermissionMode: PermissionMode = 'default';
     
     /** Callbacks to be notified when session ID is found/changed */
     private sessionFoundCallbacks: ((sessionId: string) => void)[] = [];
