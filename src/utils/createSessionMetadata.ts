@@ -10,7 +10,7 @@
 import os from 'node:os';
 import { resolve } from 'node:path';
 
-import type { AgentState, Metadata } from '@/api/types';
+import type { AgentState, Metadata, PermissionMode } from '@/api/types';
 import { configuration } from '@/configuration';
 import { projectPath } from '@/projectPath';
 import packageJson from '../../package.json';
@@ -30,6 +30,10 @@ export interface CreateSessionMetadataOptions {
     machineId: string;
     /** How the session was started */
     startedBy?: 'daemon' | 'terminal';
+    /** Initial permission mode to publish for the session (optional) */
+    permissionMode?: PermissionMode;
+    /** Timestamp (ms) for permissionMode, used for arbitration across devices (optional) */
+    permissionModeUpdatedAt?: number;
 }
 
 /**
@@ -82,7 +86,9 @@ export function createSessionMetadata(opts: CreateSessionMetadataOptions): Sessi
         startedBy: opts.startedBy || 'terminal',
         lifecycleState: 'running',
         lifecycleStateSince: Date.now(),
-        flavor: opts.flavor
+        flavor: opts.flavor,
+        ...(opts.permissionMode && { permissionMode: opts.permissionMode }),
+        ...(typeof opts.permissionModeUpdatedAt === 'number' && { permissionModeUpdatedAt: opts.permissionModeUpdatedAt }),
     };
 
     return { state, metadata };
