@@ -11,6 +11,33 @@ import { AsyncLock } from '@/utils/lock';
 import { RpcHandlerManager } from './rpc/RpcHandlerManager';
 import { registerCommonHandlers } from '../modules/common/registerCommonHandlers';
 
+/**
+ * ACP (Agent Communication Protocol) message data types.
+ * This is the unified format for all agent messages - CLI adapts each provider's format to ACP.
+ */
+export type ACPMessageData =
+    // Core message types
+    | { type: 'message'; message: string }
+    | { type: 'reasoning'; message: string }
+    | { type: 'thinking'; text: string }
+    // Tool interactions
+    | { type: 'tool-call'; callId: string; name: string; input: unknown; id: string }
+    | { type: 'tool-result'; callId: string; output: unknown; id: string; isError?: boolean }
+    // File operations
+    | { type: 'file-edit'; description: string; filePath: string; diff?: string; oldContent?: string; newContent?: string; id: string }
+    // Terminal/command output
+    | { type: 'terminal-output'; data: string; callId: string }
+    // Task lifecycle events
+    | { type: 'task_started'; id: string }
+    | { type: 'task_complete'; id: string }
+    | { type: 'turn_aborted'; id: string }
+    // Permissions
+    | { type: 'permission-request'; permissionId: string; toolName: string; description: string; options?: unknown }
+    // Usage/metrics
+    | { type: 'token_count'; [key: string]: unknown };
+
+export type ACPProvider = 'gemini' | 'codex' | 'claude' | 'opencode';
+
 export class ApiSessionClient extends EventEmitter {
     private readonly token: string;
     readonly sessionId: string;
@@ -26,14 +53,6 @@ export class ApiSessionClient extends EventEmitter {
     private metadataLock = new AsyncLock();
     private encryptionKey: Uint8Array;
     private encryptionVariant: 'legacy' | 'dataKey';
-
-    private canSend(context: string, details?: Record<string, unknown>): boolean {
-        if (!this.socket.connected) {
-            logger.debug(`[API] Socket not connected, cannot send ${context}. Message will be lost.`, details);
-            return false;
-        }
-        return true;
-    }
 
     constructor(token: string, session: Session) {
         super()
@@ -212,7 +231,10 @@ export class ApiSessionClient extends EventEmitter {
         logger.debugLargeJson('[SOCKET] Sending message through socket:', content)
 
         // Check if socket is connected before sending
-        if (!this.canSend('Claude session message', { type: body.type })) return;
+        if (!this.socket.connected) {
+            logger.debug('[API] Socket not connected, cannot send Claude session message. Message will be lost:', { type: body.type });
+            return;
+        }
 
         const encrypted = encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, content));
         this.socket.emit('message', {
@@ -252,12 +274,14 @@ export class ApiSessionClient extends EventEmitter {
                 sentFrom: 'cli'
             }
         };
-        
-        // Check if socket is connected before sending
-        if (!this.canSend('Codex message', { type: body?.type })) return;
-
         const encrypted = encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, content));
-        
+
+        // Check if socket is connected before sending
+        if (!this.socket.connected) {
+            logger.debug('[API] Socket not connected, cannot send message. Message will be lost:', { type: body.type });
+            // TODO: Consider implementing message queue or HTTP fallback for reliability
+        }
+
         this.socket.emit('message', {
             sid: this.sessionId,
             message: encrypted
@@ -265,17 +289,18 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     /**
-     * Send a generic agent message to the session.
-     * Works for any agent type (Gemini, Codex, Claude, etc.)
+     * Send a generic agent message to the session using ACP (Agent Communication Protocol) format.
+     * Works for any agent type (Gemini, Codex, Claude, etc.) - CLI normalizes to unified ACP format.
      * 
-     * @param agentType - The type of agent sending the message (e.g., 'gemini', 'codex', 'claude')
-     * @param body - The message payload
+     * @param provider - The agent provider sending the message (e.g., 'gemini', 'codex', 'claude')
+     * @param body - The message payload (type: 'message' | 'reasoning' | 'tool-call' | 'tool-result')
      */
-    sendAgentMessage(agentType: 'gemini' | 'codex' | 'claude' | 'opencode', body: any) {
+    sendAgentMessage(provider: 'gemini' | 'codex' | 'claude' | 'opencode', body: ACPMessageData) {
         let content = {
             role: 'agent',
             content: {
-                type: agentType,
+                type: 'acp',
+                provider,
                 data: body
             },
             meta: {
@@ -283,10 +308,7 @@ export class ApiSessionClient extends EventEmitter {
             }
         };
         
-        logger.debug(`[SOCKET] Sending ${agentType} message:`, { type: body.type, hasMessage: !!body.message });
-
-        // Check if socket is connected before sending
-        if (!this.canSend(`${agentType} message`, { agentType, type: body?.type })) return;
+        logger.debug(`[SOCKET] Sending ACP message from ${provider}:`, { type: body.type, hasMessage: 'message' in body });
 
         const encrypted = encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, content));
 
@@ -305,9 +327,6 @@ export class ApiSessionClient extends EventEmitter {
     } | {
         type: 'ready'
     }, id?: string) {
-        // Check if socket is connected before doing work (encryption/UUID generation)
-        if (!this.canSend('session event', { eventType: event.type })) return;
-
         let content = {
             role: 'agent',
             content: {
